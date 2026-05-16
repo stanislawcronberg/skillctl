@@ -19,8 +19,9 @@ use std::time::Instant;
     name = "skillctl",
     about = "skillctl — for when it's a skill issue.",
     long_about = "skillctl — for when it's a skill issue.\n\n\
-                  Point Claude & Codex at a marketplace worktree, then reset \
-                  them back.",
+                  Test the skills you're editing in a live Claude & Codex by \
+                  pointing both at your marketplace worktree, then reset them \
+                  back.",
     version
 )]
 pub struct Cli {
@@ -39,9 +40,9 @@ enum Command {
         #[arg(long)]
         default_branch: Option<String>,
     },
-    /// Point Codex then Claude at this worktree; install every plugin.
+    /// Point Codex then Claude at this worktree so your edited skills go live.
     Sync,
-    /// Point both runtimes back at the repo's default branch.
+    /// Snap both runtimes back to the repo's default branch.
     Reset,
     /// Live snapshot of where both runtimes currently point.
     Status,

@@ -2,14 +2,15 @@
 
 *For when it's a skill issue.*
 
-Point **Claude Code** and **Codex** at a marketplace worktree, then reset them
-back — in one command.
+Test the skills you're editing in a live **Claude Code** and **Codex** — then
+snap both back — in one command.
 
-If you maintain an agent skills/plugins marketplace, you *edit* it in one place
-and *test* the agents somewhere else. `skillctl` makes that loop fast: register
-the worktree you're editing with both runtimes and install every plugin, go
-test in any other project, then snap both runtimes back to the repo's default
-branch when you're done.
+You author agent **skills** in one repo but *use* them somewhere else, and a
+skill only counts once a runtime actually loads it. `skillctl` closes that
+loop: it points Claude and Codex at the marketplace worktree you're editing and
+installs every plugin in it, so the skills you just changed go live. Test them
+in any other project, then `skillctl reset` snaps both runtimes back to the
+repo's default branch.
 
 > **Restart required.** Claude and Codex only pick up marketplace changes on
 > restart/reload. `skillctl` never inspects a running runtime, so `sync` and
@@ -19,8 +20,9 @@ branch when you're done.
 
 - A stable **Rust** toolchain to build — [rustup.rs](https://rustup.rs)
 - **`claude`** and **`codex`** on your `PATH`
-- A Git worktree of a marketplace repo containing **both** definitions:
-  `.claude-plugin/marketplace.json` and `.agents/plugins/marketplace.json`
+- A Git worktree of the marketplace repo that ships your skills, containing
+  **both** definitions: `.claude-plugin/marketplace.json` and
+  `.agents/plugins/marketplace.json`
 
 ## Install
 
@@ -35,8 +37,8 @@ Run everything from inside a worktree of your marketplace repo.
 ```bash
 cd ~/worktrees/agent-marketplace-pr-123
 skillctl init      # once per machine: detect repo, write the config
-skillctl sync      # point Codex + Claude at THIS worktree, install all plugins
-# → restart Claude & Codex, then test the skills/plugins in any other project
+skillctl sync      # point Codex + Claude at THIS worktree, install every plugin
+# → restart Claude & Codex, then exercise the edited skills in any other project
 skillctl reset     # point both back at the repo's default branch
 # → restart Claude & Codex again
 ```
@@ -46,7 +48,7 @@ skillctl reset     # point both back at the repo's default branch
 | Command | What it does |
 |---|---|
 | `init` | Detect the repo and write `~/.config/skillctl/config.toml`. Flags: `--force` (overwrite), `--default-branch <b>`. |
-| `sync` | Validate everything **before touching anything**, then point Codex and Claude at the current worktree and install every plugin. Claude captures the *live* working tree, including uncommitted edits. A pre-flight failure changes nothing. |
+| `sync` | Validate everything **before touching anything**, then point Codex and Claude at the current worktree and install every plugin, putting your edited skills live. Claude captures the *live* working tree, including uncommitted edits. A pre-flight failure changes nothing. |
 | `reset` | Point both runtimes back at the configured repo's default branch and reinstall every plugin. |
 | `status` | Live snapshot: configured remote, worktree branch/commit/dirty, whether `origin` matches, detected marketplace names, and where each runtime currently points. |
 

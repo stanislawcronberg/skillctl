@@ -2,7 +2,7 @@
 name = "skillctl"
 version = "0.1.0"
 edition = "2021"
-description = "Point Claude & Codex at a marketplace worktree, then reset them back."
+description = "Test the agent skills you're editing in a live Claude & Codex, then reset back."
 license = "MIT"
 readme = "README.md"
 
