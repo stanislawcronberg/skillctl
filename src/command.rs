@@ -134,7 +134,6 @@ pub fn init(
     cwd: &Utf8Path,
     config_path: &Utf8Path,
     force: bool,
-    default_branch_override: Option<&str>,
     selection: TargetSelection,
 ) -> Result<InitReport> {
     let repo_root = git::repo_root(runner, cwd)?;
@@ -147,10 +146,7 @@ pub fn init(
     }
 
     let remote = git::origin_url(runner, &repo_root)?;
-    let default_branch = match default_branch_override {
-        Some(b) => b.to_string(),
-        None => git::default_branch(runner, &repo_root),
-    };
+    let default_branch = git::default_branch(runner, &repo_root);
 
     let claude_file = repo_root.join(config::CLAUDE_MARKETPLACE_FILE).exists();
     let codex_file = repo_root.join(config::CODEX_MARKETPLACE_FILE).exists();
@@ -1244,7 +1240,6 @@ mod orchestration_tests {
             &repo,
             Utf8Path::new("/cfg.toml"),
             false,
-            None,
             TargetSelection::Auto,
         )
         .unwrap_err()
@@ -1264,7 +1259,7 @@ mod orchestration_tests {
                 "get-url",
                 CommandOutput::ok("git@github.com:co/r.git"),
             );
-        let err = init(&r, &repo, &cfg_path, false, None, TargetSelection::Auto)
+        let err = init(&r, &repo, &cfg_path, false, TargetSelection::Auto)
             .unwrap_err()
             .to_string();
         assert!(err.contains("--force"), "{err}");
@@ -1290,7 +1285,7 @@ mod orchestration_tests {
         // Both CLIs present, but only the Claude marketplace file exists.
         let r = init_runner(&repo, "git@github.com:co/agent-mkt.git");
 
-        let report = init(&r, &repo, &cfg_path, false, None, TargetSelection::Auto).unwrap();
+        let report = init(&r, &repo, &cfg_path, false, TargetSelection::Auto).unwrap();
 
         assert_eq!(report.remote, "git@github.com:co/agent-mkt.git");
         assert!(report.claude.enabled);
@@ -1321,7 +1316,7 @@ mod orchestration_tests {
             CommandOutput::fail(127, "command not found"),
         );
 
-        let report = init(&r, &repo, &cfg_path, false, None, TargetSelection::Auto).unwrap();
+        let report = init(&r, &repo, &cfg_path, false, TargetSelection::Auto).unwrap();
 
         assert!(report.claude.enabled);
         assert!(!report.codex.enabled);
@@ -1340,15 +1335,7 @@ mod orchestration_tests {
             CommandOutput::fail(127, "command not found"),
         );
 
-        let report = init(
-            &r,
-            &repo,
-            &cfg_path,
-            false,
-            None,
-            TargetSelection::CodexOnly,
-        )
-        .unwrap();
+        let report = init(&r, &repo, &cfg_path, false, TargetSelection::CodexOnly).unwrap();
 
         assert!(report.codex.enabled);
         assert!(!report.codex.file_present);
@@ -1369,30 +1356,11 @@ mod orchestration_tests {
         let cfg_path = repo.join("config.toml");
         // No marketplace files at all → both targets skip → hard error.
         let r = init_runner(&repo, "git@github.com:co/r.git");
-        let err = init(&r, &repo, &cfg_path, false, None, TargetSelection::Auto)
+        let err = init(&r, &repo, &cfg_path, false, TargetSelection::Auto)
             .unwrap_err()
             .to_string();
         assert!(err.contains("no runtimes to manage"), "{err}");
         assert!(!cfg_path.exists(), "no config may be written on this error");
-    }
-
-    #[test]
-    fn init_default_branch_override_wins() {
-        let (_d, repo) = tmp();
-        let cfg_path = repo.join("config.toml");
-        let r = init_runner(&repo, "git@github.com:co/r.git");
-        // --claude-only sidesteps file/CLI detection so the test stays
-        // focused on the branch override.
-        let report = init(
-            &r,
-            &repo,
-            &cfg_path,
-            false,
-            Some("release"),
-            TargetSelection::ClaudeOnly,
-        )
-        .unwrap();
-        assert_eq!(report.default_branch, "release");
     }
 }
 

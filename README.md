@@ -48,7 +48,7 @@ skillctl reset     # point both back at the repo's default branch
 
 | Command | What it does |
 |---|---|
-| `init` | Detect the repo and write `~/.config/skillctl/config.toml`. By default a runtime is managed only when its CLI is on `PATH` **and** its marketplace file is in the repo, so a Codex-only (or Claude-only) machine just works. Flags: `--force` (overwrite), `--default-branch <b>`, `--claude-only` / `--codex-only` (mutually exclusive — scope to one runtime regardless of detection). |
+| `init` | Detect the repo and write `~/.config/skillctl/config.toml`. By default a runtime is managed only when its CLI is on `PATH` **and** its marketplace file is in the repo, so a Codex-only (or Claude-only) machine just works. Flags: `--force` (overwrite), `--claude-only` / `--codex-only` (mutually exclusive — scope to one runtime regardless of detection). |
 | `sync` | Validate everything **before touching anything**, then point Codex and Claude at the current worktree and install every plugin, putting your edited skills live. Claude captures the *live* working tree, including uncommitted edits. A pre-flight failure changes nothing. |
 | `reset` | Point both runtimes back at the configured repo's default branch and reinstall every plugin. |
 | `status` | Live snapshot: configured remote, worktree branch/commit/dirty, whether `origin` matches, detected marketplace names, and where each runtime currently points. |

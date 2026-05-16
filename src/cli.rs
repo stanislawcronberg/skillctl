@@ -40,9 +40,6 @@ enum Command {
         /// Overwrite an existing config.
         #[arg(long)]
         force: bool,
-        /// Override the detected default branch (display only).
-        #[arg(long)]
-        default_branch: Option<String>,
         /// Manage only Claude (ignore Codex entirely).
         #[arg(long, conflicts_with = "codex_only")]
         claude_only: bool,
@@ -85,7 +82,6 @@ pub fn run() -> Result<()> {
     match cli.command {
         Command::Init {
             force,
-            default_branch,
             claude_only,
             codex_only,
         } => {
@@ -95,14 +91,7 @@ pub fn run() -> Result<()> {
                 _ => TargetSelection::Auto,
             };
             let cfg_path = skillctl_config_path()?;
-            let report = command::init(
-                &runner,
-                &cwd()?,
-                &cfg_path,
-                force,
-                default_branch.as_deref(),
-                selection,
-            )?;
+            let report = command::init(&runner, &cwd()?, &cfg_path, force, selection)?;
             emit(&output::render_init(&report))?;
         }
         Command::Sync => {
