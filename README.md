@@ -128,4 +128,4 @@ skillctl reset     # both back on the repo's default branch
 
 ## License
 
-TBD.
+[MIT](LICENSE) © stanislawcronberg

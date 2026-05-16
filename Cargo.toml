@@ -3,6 +3,8 @@ name = "skillctl"
 version = "0.0.0"
 edition = "2021"
 description = "Point Claude & Codex at a marketplace worktree, then reset them back."
+license = "MIT"
+readme = "README.md"
 
 [[bin]]
 name = "skillctl"
