@@ -5,15 +5,40 @@
 //! the stream boundary when output is piped or `NO_COLOR` is set (exactly
 //! uv's approach), so every renderer here stays testable as plain text.
 
-use crate::command::{InitReport, StatusReport};
+use crate::command::{InitReport, StatusReport, SyncReport};
 use camino::Utf8Path;
 use owo_colors::OwoColorize;
 #[cfg(test)]
 use std::cell::RefCell;
 use std::time::Duration;
 
+/// The enabled runtimes, named for a user-facing sentence: `"Claude and
+/// Codex"` / `"Claude"` / `"Codex"`. Scopes every restart message so a
+/// Codex-only user is never told to restart a Claude they don't run.
+fn runtimes_phrase(claude: bool, codex: bool) -> &'static str {
+    match (claude, codex) {
+        (true, true) => "Claude and Codex",
+        (true, false) => "Claude",
+        (false, true) => "Codex",
+        (false, false) => "the configured runtimes",
+    }
+}
+
 /// Restart is *always* required — skillctl never inspects a running runtime.
-pub const RESTART_NOTICE: &str = "not live until you restart Claude and Codex";
+pub fn restart_notice(claude: bool, codex: bool) -> String {
+    format!(
+        "not live until you restart {}",
+        runtimes_phrase(claude, codex)
+    )
+}
+
+/// The advisory variant `status` prints (no mutation just happened).
+pub fn restart_reminder(claude: bool, codex: bool) -> String {
+    format!(
+        "restart {} after any sync/reset",
+        runtimes_phrase(claude, codex)
+    )
+}
 
 /// Human-readable elapsed time: `12ms`, `1.34s`, `1m 05s`.
 ///
@@ -144,11 +169,17 @@ impl Reporter for RecordingReporter {
 
 // --- summaries (stderr, on success) -----------------------------------------
 
-pub fn sync_summary(plugins: usize, took: Duration) -> String {
+/// Scope-aware: Claude installs per-plugin (count it), but a Codex-only sync
+/// installs no plugins — say what it *did* do instead of "Synced 0 plugins".
+pub fn sync_summary(report: &SyncReport, took: Duration) -> String {
+    let what = match report.plugins.len() {
+        0 => "Codex marketplace".to_string(),
+        n => format!("{n} plugin{}", if n == 1 { "" } else { "s" }),
+    };
     format!(
         "\n  {} {} in {}",
         "Synced".green().bold(),
-        format_args!("{plugins} plugin{}", if plugins == 1 { "" } else { "s" }).bold(),
+        what.bold(),
         elapsed(took).dimmed()
     )
 }
@@ -164,9 +195,25 @@ pub fn reset_summary(owner_repo: &str, took: Duration) -> String {
 
 // --- status (stdout) --------------------------------------------------------
 
+/// One status row's value: a disabled target reads as a deliberate
+/// `(not managed)`, never the broken-looking `(no marketplace file detected)`.
+fn target_cell(
+    enabled: bool,
+    name: &Option<String>,
+    src: &Option<String>,
+    worktree: &str,
+) -> String {
+    if enabled {
+        pointed(name, src, worktree)
+    } else {
+        format!("{}", "(not managed)".dimmed())
+    }
+}
+
 fn pointed(name: &Option<String>, src: &Option<String>, worktree: &str) -> String {
+    use crate::command::same_path;
     match (name, src) {
-        (Some(n), Some(s)) if s.trim_end_matches('/') == worktree.trim_end_matches('/') => {
+        (Some(n), Some(s)) if same_path(s, worktree) => {
             format!("{n} {} {}", "→".dimmed(), "this worktree".green())
         }
         (Some(n), Some(s)) => format!("{n} {} {}", "→".dimmed(), s.yellow()),
@@ -207,11 +254,11 @@ pub fn render_status(s: &StatusReport) -> String {
     out.push_str(&format!("{:LABEL_COL$}{match_line}\n", ""));
     out.push_str(&row(
         "Claude",
-        pointed(&s.claude_name, &s.claude_pointed_at, wt),
+        target_cell(s.claude_enabled, &s.claude_name, &s.claude_pointed_at, wt),
     ));
     out.push_str(&row(
         "Codex",
-        pointed(&s.codex_name, &s.codex_pointed_at, wt),
+        target_cell(s.codex_enabled, &s.codex_name, &s.codex_pointed_at, wt),
     ));
     out.push_str(&format!(
         "\n  {} ({})\n",
@@ -232,17 +279,37 @@ pub fn render_init(report: &InitReport) -> String {
     out.push_str(&row("repo", &report.repo_root));
     out.push_str(&row("remote", &report.remote));
     out.push_str(&row("branch", &report.default_branch));
-    if !report.claude_file_present {
-        out.push_str(&format!(
-            "  {}\n",
-            warning("Claude marketplace file not found at the configured path")
-        ));
+
+    let targets = [("claude", &report.claude), ("codex", &report.codex)];
+
+    let enabled: Vec<&str> = targets
+        .iter()
+        .filter(|(_, t)| t.enabled)
+        .map(|(n, _)| *n)
+        .collect();
+    out.push_str(&row("targets", enabled.join(", ")));
+
+    // A dimmed reason for anything skipped — the "you're only managing X"
+    // signal, at the moment the decision is made.
+    for (name, t) in targets {
+        if let Some(reason) = &t.skip_reason {
+            out.push_str(&format!(
+                "  {}\n",
+                format!("{:<LABEL_W$} {name} — {reason}", "skipped").dimmed()
+            ));
+        }
     }
-    if !report.codex_file_present {
-        out.push_str(&format!(
-            "  {}\n",
-            warning("Codex marketplace file not found at the configured path")
-        ));
+    // An enabled target whose file is absent (only reachable via an explicit
+    // --*-only override) still works once that file lands — warn, don't fail.
+    for (name, t) in targets {
+        if t.enabled && !t.file_present {
+            out.push_str(&format!(
+                "  {}\n",
+                warning(&format!(
+                    "{name} marketplace file not found at the configured path"
+                ))
+            ));
+        }
     }
     out
 }
@@ -321,6 +388,8 @@ mod tests {
             },
             remote_matches: false,
             default_branch: "main".into(),
+            claude_enabled: true,
+            codex_enabled: true,
             claude_name: Some("M".into()),
             codex_name: None,
             claude_pointed_at: Some("/work/wt".into()),
@@ -359,6 +428,8 @@ mod tests {
             },
             remote_matches: true,
             default_branch: "main".into(),
+            claude_enabled: true,
+            codex_enabled: true,
             claude_name: Some("M".into()),
             codex_name: None,
             claude_pointed_at: Some("/some/OTHER/path".into()),
@@ -367,6 +438,104 @@ mod tests {
         let txt = plain(&render_status(&s));
         assert!(txt.contains("✓ matches configured remote"), "{txt}");
         assert!(txt.contains("Claude   M → /some/OTHER/path"), "{txt}");
+    }
+
+    #[test]
+    fn status_shows_a_disabled_runtime_as_not_managed_not_broken() {
+        let s = StatusReport {
+            configured_remote: "r".into(),
+            repo: RepoState {
+                root: "/work/wt".into(),
+                branch: "b".into(),
+                commit: "c".into(),
+                dirty: false,
+                origin_url: "r".into(),
+            },
+            remote_matches: true,
+            default_branch: "main".into(),
+            claude_enabled: false,
+            codex_enabled: true,
+            claude_name: None,
+            codex_name: Some("M".into()),
+            claude_pointed_at: None,
+            codex_pointed_at: Some("/work/wt".into()),
+        };
+        let txt = plain(&render_status(&s));
+        assert!(txt.contains("Claude   (not managed)"), "{txt}");
+        assert!(
+            !txt.contains("no marketplace file detected"),
+            "disabled must not look broken: {txt}"
+        );
+        assert!(txt.contains("Codex    M → this worktree"), "{txt}");
+    }
+
+    fn outcome(enabled: bool, file: bool, reason: Option<&str>) -> crate::command::TargetOutcome {
+        crate::command::TargetOutcome {
+            enabled,
+            file_present: file,
+            skip_reason: reason.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn init_lists_managed_targets_and_explains_skips() {
+        let report = InitReport {
+            repo_root: "/repo".into(),
+            remote: "git@github.com:co/r.git".into(),
+            default_branch: "main".into(),
+            config_path: "/cfg.toml".into(),
+            claude: outcome(false, false, Some("not on PATH")),
+            codex: outcome(true, true, None),
+        };
+        let txt = plain(&render_init(&report));
+        assert!(txt.contains("targets  codex"), "{txt}");
+        assert!(txt.contains("skipped  claude — not on PATH"), "{txt}");
+        assert!(!txt.contains("warning:"), "no warning when file present: {txt}");
+    }
+
+    #[test]
+    fn init_warns_when_an_enabled_target_has_no_marketplace_file() {
+        let report = InitReport {
+            repo_root: "/repo".into(),
+            remote: "r".into(),
+            default_branch: "main".into(),
+            config_path: "/cfg.toml".into(),
+            claude: outcome(false, false, Some("excluded by --codex-only")),
+            codex: outcome(true, false, None),
+        };
+        let txt = plain(&render_init(&report));
+        assert!(txt.contains("targets  codex"), "{txt}");
+        assert!(
+            txt.contains("warning: codex marketplace file not found"),
+            "{txt}"
+        );
+    }
+
+    #[test]
+    fn restart_messaging_names_only_the_enabled_runtimes() {
+        assert_eq!(restart_notice(true, true), "not live until you restart Claude and Codex");
+        assert_eq!(restart_notice(false, true), "not live until you restart Codex");
+        assert_eq!(restart_reminder(true, false), "restart Claude after any sync/reset");
+    }
+
+    #[test]
+    fn sync_summary_does_not_say_zero_plugins_for_a_codex_only_sync() {
+        let codex_only = SyncReport {
+            repo_root: "/r".into(),
+            claude_name: None,
+            codex_name: Some("M".into()),
+            plugins: vec![],
+        };
+        let txt = plain(&sync_summary(&codex_only, Duration::from_millis(5)));
+        assert!(txt.contains("Synced Codex marketplace in"), "{txt}");
+        assert!(!txt.contains("0 plugin"), "{txt}");
+
+        let with_plugins = SyncReport {
+            plugins: vec!["p1".into()],
+            ..codex_only
+        };
+        assert!(plain(&sync_summary(&with_plugins, Duration::from_millis(5)))
+            .contains("Synced 1 plugin in"));
     }
 
     #[test]

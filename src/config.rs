@@ -35,6 +35,11 @@ pub struct CodexTarget {
     pub marketplace_file: Utf8PathBuf,
 }
 
+/// The fixed v0 marketplace-file locations, in one place so `Config::new` and
+/// `init`'s detection probe can never drift apart.
+pub const CLAUDE_MARKETPLACE_FILE: &str = ".claude-plugin/marketplace.json";
+pub const CODEX_MARKETPLACE_FILE: &str = ".agents/plugins/marketplace.json";
+
 impl Config {
     pub fn from_toml(s: &str) -> Result<Self> {
         toml::from_str(s).context("parsing skillctl config.toml")
@@ -44,23 +49,28 @@ impl Config {
         toml::to_string_pretty(self).expect("Config is always TOML-serializable")
     }
 
-    /// The config skillctl writes on `init` for a freshly detected repo:
-    /// fixed v0 marketplace-file paths, both targets enabled, Claude at
-    /// user scope.
-    pub fn default_for(remote: impl Into<String>) -> Self {
+    /// The config skillctl writes on `init`: fixed v0 marketplace-file paths,
+    /// Claude at user scope, each target enabled per the caller's detection /
+    /// `--*-only` decision. A disabled target keeps its path so the user can
+    /// flip `enabled = true` by hand later without re-running `init`.
+    pub fn new(
+        remote: impl Into<String>,
+        claude_enabled: bool,
+        codex_enabled: bool,
+    ) -> Self {
         Config {
             repo: RepoConfig {
                 remote: remote.into(),
             },
             targets: Targets {
                 claude: ClaudeTarget {
-                    enabled: true,
+                    enabled: claude_enabled,
                     scope: "user".to_string(),
-                    marketplace_file: ".claude-plugin/marketplace.json".into(),
+                    marketplace_file: CLAUDE_MARKETPLACE_FILE.into(),
                 },
                 codex: CodexTarget {
-                    enabled: true,
-                    marketplace_file: ".agents/plugins/marketplace.json".into(),
+                    enabled: codex_enabled,
+                    marketplace_file: CODEX_MARKETPLACE_FILE.into(),
                 },
             },
         }
@@ -129,10 +139,10 @@ marketplace_file = ".agents/plugins/marketplace.json"
     }
 
     #[test]
-    fn default_for_then_save_then_load_roundtrips() {
+    fn new_then_save_then_load_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(dir.path().join("a/b/config.toml")).unwrap();
-        let cfg = Config::default_for("git@github.com:co/repo.git");
+        let cfg = Config::new("git@github.com:co/repo.git", true, false);
         cfg.save(&path).unwrap();
         assert_eq!(Config::load(&path).unwrap(), cfg);
     }

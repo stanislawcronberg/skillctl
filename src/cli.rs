@@ -6,7 +6,7 @@
 //! warnings and hints are status and go to **stderr** so they never pollute a
 //! piped result.
 
-use crate::command::{self, RealCommandRunner};
+use crate::command::{self, RealCommandRunner, TargetSelection};
 use crate::config::{self, Config};
 use crate::output::{self, StderrReporter};
 use anyhow::{Context, Result};
@@ -32,6 +32,10 @@ pub struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Detect this repo and write `~/.config/skillctl/config.toml`.
+    ///
+    /// By default each runtime is managed only when its CLI is on PATH and
+    /// the repo ships its marketplace file. `--claude-only`/`--codex-only`
+    /// override that and scope to exactly one runtime.
     Init {
         /// Overwrite an existing config.
         #[arg(long)]
@@ -39,6 +43,12 @@ enum Command {
         /// Override the detected default branch (display only).
         #[arg(long)]
         default_branch: Option<String>,
+        /// Manage only Claude (ignore Codex entirely).
+        #[arg(long, conflicts_with = "codex_only")]
+        claude_only: bool,
+        /// Manage only Codex (ignore Claude entirely).
+        #[arg(long, conflicts_with = "claude_only")]
+        codex_only: bool,
     },
     /// Point Codex then Claude at this worktree so your edited skills go live.
     Sync,
@@ -76,7 +86,14 @@ pub fn run() -> Result<()> {
         Command::Init {
             force,
             default_branch,
+            claude_only,
+            codex_only,
         } => {
+            let selection = match (claude_only, codex_only) {
+                (true, _) => TargetSelection::ClaudeOnly,
+                (_, true) => TargetSelection::CodexOnly,
+                _ => TargetSelection::Auto,
+            };
             let cfg_path = skillctl_config_path()?;
             let report = command::init(
                 &runner,
@@ -84,6 +101,7 @@ pub fn run() -> Result<()> {
                 &cfg_path,
                 force,
                 default_branch.as_deref(),
+                selection,
             )?;
             emit(&output::render_init(&report))?;
         }
@@ -91,11 +109,14 @@ pub fn run() -> Result<()> {
             let cfg = load_config()?;
             let start = Instant::now();
             let report = command::sync(&runner, &cwd()?, &codex_config_path()?, &cfg, &reporter)?;
+            anstream::eprintln!("{}", output::sync_summary(&report, start.elapsed()));
             anstream::eprintln!(
-                "{}",
-                output::sync_summary(report.plugins.len(), start.elapsed())
+                "  {}",
+                output::warning(&output::restart_notice(
+                    cfg.targets.claude.enabled,
+                    cfg.targets.codex.enabled
+                ))
             );
-            anstream::eprintln!("  {}", output::warning(output::RESTART_NOTICE));
         }
         Command::Reset => {
             let cfg = load_config()?;
@@ -105,7 +126,13 @@ pub fn run() -> Result<()> {
                 "{}",
                 output::reset_summary(&report.owner_repo, start.elapsed())
             );
-            anstream::eprintln!("  {}", output::warning(output::RESTART_NOTICE));
+            anstream::eprintln!(
+                "  {}",
+                output::warning(&output::restart_notice(
+                    cfg.targets.claude.enabled,
+                    cfg.targets.codex.enabled
+                ))
+            );
         }
         Command::Status => {
             let cfg = load_config()?;
@@ -122,7 +149,10 @@ pub fn run() -> Result<()> {
             }
             anstream::eprintln!(
                 "  {}",
-                output::warning("restart Claude and Codex after any sync/reset")
+                output::warning(&output::restart_reminder(
+                    cfg.targets.claude.enabled,
+                    cfg.targets.codex.enabled
+                ))
             );
         }
     }

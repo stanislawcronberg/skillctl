@@ -4,7 +4,7 @@
 //! orchestration logic (ordering, exit-code tolerance, presence checks) is
 //! verifiable without touching real global state.
 
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::git;
 use crate::output::{Event, Reporter};
 use crate::targets::{claude, codex, Marketplace};
@@ -55,24 +55,87 @@ impl CommandRunner for RealCommandRunner {
 // Sub-command orchestration
 // ===========================================================================
 
+/// Which runtimes `init` should manage. `Auto` (no `--*-only` flag) enables a
+/// runtime only when its CLI is on `PATH` *and* the repo ships its marketplace
+/// file; the `*Only` variants are an explicit hard override that ignores
+/// detection entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetSelection {
+    Auto,
+    ClaudeOnly,
+    CodexOnly,
+}
+
+/// Per-runtime outcome of `init`'s detection, carried to the renderer.
+/// `skip_reason` is `Some` iff the runtime was *not* enabled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetOutcome {
+    pub enabled: bool,
+    pub file_present: bool,
+    pub skip_reason: Option<String>,
+}
+
+impl TargetOutcome {
+    fn enabled(file_present: bool) -> Self {
+        Self {
+            enabled: true,
+            file_present,
+            skip_reason: None,
+        }
+    }
+
+    fn skipped(file_present: bool, why: impl Into<String>) -> Self {
+        Self {
+            enabled: false,
+            file_present,
+            skip_reason: Some(why.into()),
+        }
+    }
+
+    /// Auto-detection rule: manage a runtime only when its CLI is on `PATH`
+    /// *and* its marketplace file is in the repo.
+    fn detected(on_path: bool, file_present: bool, no_file: impl Into<String>) -> Self {
+        if !on_path {
+            Self::skipped(file_present, "not on PATH")
+        } else if !file_present {
+            Self::skipped(file_present, no_file)
+        } else {
+            Self::enabled(file_present)
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitReport {
     pub repo_root: Utf8PathBuf,
     pub remote: String,
     pub default_branch: String,
-    pub claude_file_present: bool,
-    pub codex_file_present: bool,
+    pub claude: TargetOutcome,
+    pub codex: TargetOutcome,
     pub config_path: Utf8PathBuf,
 }
 
+/// Is `program` usable here? Routed through the [`CommandRunner`] seam (not a
+/// `which` crate) so detection is unit-testable with the same fake the
+/// orchestration tests use. A non-spawnable binary surfaces as `Err` from the
+/// real runner; both that and a non-zero `--version` mean "not on PATH".
+fn on_path(runner: &dyn CommandRunner, program: &str) -> bool {
+    runner
+        .run(program, &["--version"], None)
+        .map(|o| o.success())
+        .unwrap_or(false)
+}
+
 /// `skillctl init`: detect the repo, refuse to clobber an existing config
-/// unless `force`, and write a default config keyed to `origin`.
+/// unless `force`, decide which runtimes to manage (auto-detection or an
+/// explicit `--*-only` override), and write the config keyed to `origin`.
 pub fn init(
     runner: &dyn CommandRunner,
     cwd: &Utf8Path,
     config_path: &Utf8Path,
     force: bool,
     default_branch_override: Option<&str>,
+    selection: TargetSelection,
 ) -> Result<InitReport> {
     let repo_root = git::repo_root(runner, cwd)?;
 
@@ -89,22 +152,63 @@ pub fn init(
         None => git::default_branch(runner, &repo_root),
     };
 
-    let cfg = Config::default_for(remote.clone());
-    let claude_file_present = repo_root
-        .join(&cfg.targets.claude.marketplace_file)
-        .exists();
-    let codex_file_present = repo_root.join(&cfg.targets.codex.marketplace_file).exists();
+    let claude_file = repo_root.join(config::CLAUDE_MARKETPLACE_FILE).exists();
+    let codex_file = repo_root.join(config::CODEX_MARKETPLACE_FILE).exists();
 
-    cfg.save(config_path)?;
+    let (claude, codex) = match selection {
+        TargetSelection::Auto => (
+            TargetOutcome::detected(
+                on_path(runner, "claude"),
+                claude_file,
+                format!("no {}", config::CLAUDE_MARKETPLACE_FILE),
+            ),
+            TargetOutcome::detected(
+                on_path(runner, "codex"),
+                codex_file,
+                format!("no {}", config::CODEX_MARKETPLACE_FILE),
+            ),
+        ),
+        TargetSelection::ClaudeOnly => (
+            TargetOutcome::enabled(claude_file),
+            TargetOutcome::skipped(codex_file, "excluded by --claude-only"),
+        ),
+        TargetSelection::CodexOnly => (
+            TargetOutcome::skipped(claude_file, "excluded by --codex-only"),
+            TargetOutcome::enabled(codex_file),
+        ),
+    };
+
+    if !claude.enabled && !codex.enabled {
+        bail!(
+            "no runtimes to manage here: neither `claude` nor `codex` is on \
+             PATH with its marketplace file in this repo.\n  \
+             install a runtime and re-run, or scope explicitly with \
+             --claude-only / --codex-only"
+        );
+    }
+
+    Config::new(remote.clone(), claude.enabled, codex.enabled).save(config_path)?;
 
     Ok(InitReport {
         repo_root,
         remote,
         default_branch,
-        claude_file_present,
-        codex_file_present,
+        claude,
+        codex,
         config_path: config_path.to_path_buf(),
     })
+}
+
+/// `sync`/`reset` are no-ops with both targets off; fail loudly instead of
+/// silently doing nothing.
+fn ensure_any_target(cfg: &Config) -> Result<()> {
+    if !cfg.targets.claude.enabled && !cfg.targets.codex.enabled {
+        bail!(
+            "no targets enabled in config — re-run `skillctl init` \
+             (optionally with --claude-only / --codex-only)"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,6 +399,7 @@ pub fn sync(
     cfg: &Config,
     reporter: &dyn Reporter,
 ) -> Result<SyncReport> {
+    ensure_any_target(cfg)?;
     let pre = preflight(runner, cwd, cfg, true)?;
     let repo_root = pre.repo_root;
     let src = repo_root.as_str();
@@ -388,6 +493,7 @@ pub fn reset(
     cfg: &Config,
     reporter: &dyn Reporter,
 ) -> Result<ResetReport> {
+    ensure_any_target(cfg)?;
     let repo_root = git::repo_root(runner, cwd)?;
     let owner_repo = git::owner_repo(&cfg.repo.remote).with_context(|| {
         format!(
@@ -449,6 +555,9 @@ pub struct StatusReport {
     pub repo: git::RepoState,
     pub remote_matches: bool,
     pub default_branch: String,
+    /// Whether config manages each runtime — drives the `(not managed)` row.
+    pub claude_enabled: bool,
+    pub codex_enabled: bool,
     pub claude_name: Option<String>,
     pub codex_name: Option<String>,
     /// Where each runtime currently resolves its marketplace name, if known.
@@ -509,6 +618,8 @@ pub fn status(
         repo,
         remote_matches,
         default_branch,
+        claude_enabled: cfg.targets.claude.enabled,
+        codex_enabled: cfg.targets.codex.enabled,
         claude_name,
         codex_name,
         claude_pointed_at,
@@ -531,9 +642,11 @@ fn claude_marketplace_present(runner: &dyn CommandRunner, name: &str) -> Result<
     Ok(claude_list(runner)?.iter().any(|e| e.name == name))
 }
 
-/// Compare two filesystem paths for the post-sync identity check, tolerating
-/// only a trailing-slash difference.
-fn same_path(a: &str, b: &str) -> bool {
+/// The canonical "do these two paths point at the same worktree" rule,
+/// tolerating only a trailing-slash difference. The single source of truth
+/// for both the post-sync identity assertion (here) and the `status`
+/// renderer's "→ this worktree" decision (`output::pointed`).
+pub fn same_path(a: &str, b: &str) -> bool {
     a.trim_end_matches('/') == b.trim_end_matches('/')
 }
 
@@ -710,7 +823,7 @@ mod orchestration_tests {
         std::fs::write(repo.join(".claude-plugin/marketplace.json"), CLAUDE_MKT).unwrap();
         std::fs::write(repo.join(".agents/plugins/marketplace.json"), CODEX_MKT).unwrap();
         let codex_cfg = repo.join("codex-config.toml");
-        let cfg = Config::default_for("git@github.com:co/agent-mkt.git");
+        let cfg = Config::new("git@github.com:co/agent-mkt.git", true, true);
         Fix {
             _dir: dir,
             repo,
@@ -1126,9 +1239,16 @@ mod orchestration_tests {
             "--show-toplevel",
             CommandOutput::fail(128, "nope"),
         );
-        let err = init(&r, &repo, Utf8Path::new("/cfg.toml"), false, None)
-            .unwrap_err()
-            .to_string();
+        let err = init(
+            &r,
+            &repo,
+            Utf8Path::new("/cfg.toml"),
+            false,
+            None,
+            TargetSelection::Auto,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("not inside a git repository"), "{err}");
     }
 
@@ -1144,54 +1264,134 @@ mod orchestration_tests {
                 "get-url",
                 CommandOutput::ok("git@github.com:co/r.git"),
             );
-        let err = init(&r, &repo, &cfg_path, false, None)
+        let err = init(&r, &repo, &cfg_path, false, None, TargetSelection::Auto)
             .unwrap_err()
             .to_string();
         assert!(err.contains("--force"), "{err}");
         assert_eq!(std::fs::read_to_string(&cfg_path).unwrap(), "stale");
     }
 
+    /// Scripts just `git` for a clean `init`. A `<cli> --version` probe is
+    /// left unscripted so the runner's unmatched-ok default makes the CLI
+    /// "present"; a test scripts an explicit failing rule to make one absent.
+    fn init_runner(repo: &Utf8Path, origin: &str) -> RecordingRunner {
+        RecordingRunner::new()
+            .on_arg("git", "--show-toplevel", CommandOutput::ok(repo.as_str()))
+            .on_arg("git", "get-url", CommandOutput::ok(origin))
+            .on_arg("git", "symbolic-ref", CommandOutput::ok("origin/main"))
+    }
+
     #[test]
-    fn init_writes_default_config_keyed_to_origin() {
+    fn init_auto_enables_only_runtimes_that_ship_a_marketplace_file() {
         let (_d, repo) = tmp();
         std::fs::create_dir_all(repo.join(".claude-plugin")).unwrap();
         std::fs::write(repo.join(".claude-plugin/marketplace.json"), "{}").unwrap();
         let cfg_path = repo.join("sub/config.toml");
-        let r = RecordingRunner::new()
-            .on_arg("git", "--show-toplevel", CommandOutput::ok(repo.as_str()))
-            .on_arg(
-                "git",
-                "get-url",
-                CommandOutput::ok("git@github.com:co/agent-mkt.git"),
-            )
-            .on_arg("git", "symbolic-ref", CommandOutput::ok("origin/trunk"));
+        // Both CLIs present, but only the Claude marketplace file exists.
+        let r = init_runner(&repo, "git@github.com:co/agent-mkt.git");
 
-        let report = init(&r, &repo, &cfg_path, false, None).unwrap();
+        let report = init(&r, &repo, &cfg_path, false, None, TargetSelection::Auto).unwrap();
 
         assert_eq!(report.remote, "git@github.com:co/agent-mkt.git");
-        assert_eq!(report.default_branch, "trunk");
-        assert!(report.claude_file_present);
-        assert!(!report.codex_file_present);
-        let saved = Config::load(&cfg_path).unwrap();
+        assert!(report.claude.enabled);
+        assert!(!report.codex.enabled);
         assert_eq!(
-            saved,
-            Config::default_for("git@github.com:co/agent-mkt.git")
+            report.codex.skip_reason.as_deref(),
+            Some("no .agents/plugins/marketplace.json")
         );
+        assert_eq!(
+            Config::load(&cfg_path).unwrap(),
+            Config::new("git@github.com:co/agent-mkt.git", true, false)
+        );
+    }
+
+    #[test]
+    fn init_auto_skips_a_runtime_not_on_path() {
+        let (_d, repo) = tmp();
+        for f in [".claude-plugin", ".agents/plugins"] {
+            std::fs::create_dir_all(repo.join(f)).unwrap();
+        }
+        std::fs::write(repo.join(".claude-plugin/marketplace.json"), "{}").unwrap();
+        std::fs::write(repo.join(".agents/plugins/marketplace.json"), "{}").unwrap();
+        let cfg_path = repo.join("config.toml");
+        // Codex CLI is absent even though the repo ships its file.
+        let r = init_runner(&repo, "git@github.com:co/r.git").on_arg(
+            "codex",
+            "--version",
+            CommandOutput::fail(127, "command not found"),
+        );
+
+        let report = init(&r, &repo, &cfg_path, false, None, TargetSelection::Auto).unwrap();
+
+        assert!(report.claude.enabled);
+        assert!(!report.codex.enabled);
+        assert_eq!(report.codex.skip_reason.as_deref(), Some("not on PATH"));
+    }
+
+    #[test]
+    fn init_codex_only_overrides_detection_even_with_no_file_or_cli() {
+        let (_d, repo) = tmp();
+        let cfg_path = repo.join("config.toml");
+        // No marketplace files, codex CLI absent — the override still wins,
+        // surfacing the missing file as a warning (file_present == false).
+        let r = init_runner(&repo, "git@github.com:co/r.git").on_arg(
+            "codex",
+            "--version",
+            CommandOutput::fail(127, "command not found"),
+        );
+
+        let report = init(
+            &r,
+            &repo,
+            &cfg_path,
+            false,
+            None,
+            TargetSelection::CodexOnly,
+        )
+        .unwrap();
+
+        assert!(report.codex.enabled);
+        assert!(!report.codex.file_present);
+        assert!(!report.claude.enabled);
+        assert_eq!(
+            report.claude.skip_reason.as_deref(),
+            Some("excluded by --codex-only")
+        );
+        assert_eq!(
+            Config::load(&cfg_path).unwrap(),
+            Config::new("git@github.com:co/r.git", false, true)
+        );
+    }
+
+    #[test]
+    fn init_errs_when_auto_detection_finds_no_runtime() {
+        let (_d, repo) = tmp();
+        let cfg_path = repo.join("config.toml");
+        // No marketplace files at all → both targets skip → hard error.
+        let r = init_runner(&repo, "git@github.com:co/r.git");
+        let err = init(&r, &repo, &cfg_path, false, None, TargetSelection::Auto)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no runtimes to manage"), "{err}");
+        assert!(!cfg_path.exists(), "no config may be written on this error");
     }
 
     #[test]
     fn init_default_branch_override_wins() {
         let (_d, repo) = tmp();
         let cfg_path = repo.join("config.toml");
-        let r = RecordingRunner::new()
-            .on_arg("git", "--show-toplevel", CommandOutput::ok(repo.as_str()))
-            .on_arg(
-                "git",
-                "get-url",
-                CommandOutput::ok("git@github.com:co/r.git"),
-            )
-            .on_arg("git", "symbolic-ref", CommandOutput::ok("origin/main"));
-        let report = init(&r, &repo, &cfg_path, false, Some("release")).unwrap();
+        let r = init_runner(&repo, "git@github.com:co/r.git");
+        // --claude-only sidesteps file/CLI detection so the test stays
+        // focused on the branch override.
+        let report = init(
+            &r,
+            &repo,
+            &cfg_path,
+            false,
+            Some("release"),
+            TargetSelection::ClaudeOnly,
+        )
+        .unwrap();
         assert_eq!(report.default_branch, "release");
     }
 }
