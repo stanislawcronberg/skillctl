@@ -1,17 +1,26 @@
 //! Argument parsing and the thin dispatch that wires real I/O to the
 //! orchestration in [`crate::command`].
+//!
+//! Stream discipline: the `status` report is the command's *answer* and goes
+//! to **stdout**; progress (the streamed sync/reset trail), summaries,
+//! warnings and hints are status and go to **stderr** so they never pollute a
+//! piped result.
 
 use crate::command::{self, RealCommandRunner};
 use crate::config::{self, Config};
-use crate::output;
+use crate::output::{self, StderrReporter};
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
+use std::time::Instant;
 
 #[derive(Parser)]
 #[command(
     name = "skillctl",
-    about = "Point Claude & Codex at a marketplace worktree, then reset them back.",
+    about = "skillctl — for when it's a skill issue.",
+    long_about = "skillctl — for when it's a skill issue.\n\n\
+                  Point Claude & Codex at a marketplace worktree, then reset \
+                  them back.",
     version
 )]
 pub struct Cli {
@@ -60,6 +69,7 @@ fn cwd() -> Result<Utf8PathBuf> {
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let runner = RealCommandRunner;
+    let reporter = StderrReporter;
 
     match cli.command {
         Command::Init {
@@ -74,40 +84,61 @@ pub fn run() -> Result<()> {
                 force,
                 default_branch.as_deref(),
             )?;
-            println!("Wrote {}", report.config_path);
-            println!("  repo:   {}", report.repo_root);
-            println!("  remote: {}", report.remote);
-            println!("  default branch: {}", report.default_branch);
-            if !report.claude_file_present {
-                println!(
-                    "  warning: Claude marketplace file not found at the \
-                     configured path"
-                );
-            }
-            if !report.codex_file_present {
-                println!(
-                    "  warning: Codex marketplace file not found at the \
-                     configured path"
-                );
-            }
+            emit(&output::render_init(&report))?;
         }
         Command::Sync => {
             let cfg = load_config()?;
-            let report = command::sync(&runner, &cwd()?, &codex_config_path()?, &cfg)?;
-            print!("{}", output::render_sync(&report));
+            let start = Instant::now();
+            let report = command::sync(&runner, &cwd()?, &codex_config_path()?, &cfg, &reporter)?;
+            anstream::eprintln!(
+                "{}",
+                output::sync_summary(report.plugins.len(), start.elapsed())
+            );
+            anstream::eprintln!("  {}", output::warning(output::RESTART_NOTICE));
         }
         Command::Reset => {
             let cfg = load_config()?;
-            let report = command::reset(&runner, &cwd()?, &cfg)?;
-            print!("{}", output::render_reset(&report));
+            let start = Instant::now();
+            let report = command::reset(&runner, &cwd()?, &cfg, &reporter)?;
+            anstream::eprintln!(
+                "{}",
+                output::reset_summary(&report.owner_repo, start.elapsed())
+            );
+            anstream::eprintln!("  {}", output::warning(output::RESTART_NOTICE));
         }
         Command::Status => {
             let cfg = load_config()?;
             let report = command::status(&runner, &cwd()?, &codex_config_path()?, &cfg)?;
-            print!("{}", output::render_status(&report));
+            emit(&output::render_status(&report))?;
+            if !report.remote_matches {
+                anstream::eprintln!(
+                    "  {}",
+                    output::hint(
+                        "`skillctl sync` will refuse until origin matches the \
+                         configured remote"
+                    )
+                );
+            }
+            anstream::eprintln!(
+                "  {}",
+                output::warning("restart Claude and Codex after any sync/reset")
+            );
         }
     }
     Ok(())
+}
+
+/// Write a stdout payload, exiting silently (status 0) on a closed pipe so
+/// `skillctl status | head` behaves like a normal Unix tool instead of
+/// panicking the way `println!` would.
+fn emit(s: &str) -> Result<()> {
+    use std::io::Write;
+    let mut out = anstream::stdout();
+    match writeln!(out, "{s}").and_then(|()| out.flush()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
+        Err(e) => Err(e).context("writing to stdout"),
+    }
 }
 
 fn load_config() -> Result<Config> {

@@ -6,6 +6,7 @@
 
 use crate::config::Config;
 use crate::git;
+use crate::output::{Event, Reporter};
 use crate::targets::{claude, codex, Marketplace};
 use anyhow::{bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -209,6 +210,7 @@ fn apply_marketplace(
     claude_mkt: Option<&Marketplace>,
     codex_mkt: Option<&Marketplace>,
     scope: &str,
+    reporter: &dyn Reporter,
 ) -> Result<Applied> {
     let codex_name = if let Some(m) = codex_mkt {
         let _ = runner.run("codex", &["plugin", "marketplace", "remove", &m.name], None)?; // exit 1 (absent) tolerated
@@ -219,6 +221,10 @@ fn apply_marketplace(
                 add.stderr.trim()
             );
         }
+        reporter.event(Event::Marketplace {
+            runtime: "Codex",
+            name: &m.name,
+        });
         Some(m.name.clone())
     } else {
         None
@@ -247,6 +253,10 @@ fn apply_marketplace(
                 add.stderr.trim()
             );
         }
+        reporter.event(Event::Marketplace {
+            runtime: "Claude",
+            name: &m.name,
+        });
         for p in &m.plugins {
             let spec = format!("{p}@{}", m.name);
             let inst = runner.run(
@@ -260,6 +270,7 @@ fn apply_marketplace(
                     inst.stderr.trim()
                 );
             }
+            reporter.event(Event::Plugin { name: p });
         }
         plugins = m.plugins.clone();
         Some(m.name.clone())
@@ -282,10 +293,24 @@ pub fn sync(
     cwd: &Utf8Path,
     codex_config: &Utf8Path,
     cfg: &Config,
+    reporter: &dyn Reporter,
 ) -> Result<SyncReport> {
     let pre = preflight(runner, cwd, cfg, true)?;
     let repo_root = pre.repo_root;
     let src = repo_root.as_str();
+
+    // Announce the target *now* — after validation, before the first
+    // mutation — so the worktree is on screen even if a later step fails.
+    let st = git::work_state(runner, &repo_root)?;
+    let target = git::owner_repo(&cfg.repo.remote).unwrap_or_else(|| cfg.repo.remote.clone());
+    reporter.event(Event::Target {
+        action: "Syncing",
+        target: &target,
+        root: &repo_root,
+        branch: &st.branch,
+        commit: &st.commit,
+        dirty: st.dirty,
+    });
 
     let Applied {
         codex_name,
@@ -297,6 +322,7 @@ pub fn sync(
         pre.claude_mkt.as_ref(),
         pre.codex_mkt.as_ref(),
         cfg.targets.claude.scope.as_str(),
+        reporter,
     )?;
 
     // ---- Post-sync assertion (loud): both runtimes must now resolve the
@@ -356,7 +382,12 @@ pub struct ResetReport {
 /// Codex-first, like `sync`. Claude's `marketplace remove` orphans its
 /// installed plugins, so every plugin is reinstalled afterwards. Recovery
 /// command: it does *not* check the worktree's `origin` or run validators.
-pub fn reset(runner: &dyn CommandRunner, cwd: &Utf8Path, cfg: &Config) -> Result<ResetReport> {
+pub fn reset(
+    runner: &dyn CommandRunner,
+    cwd: &Utf8Path,
+    cfg: &Config,
+    reporter: &dyn Reporter,
+) -> Result<ResetReport> {
     let repo_root = git::repo_root(runner, cwd)?;
     let owner_repo = git::owner_repo(&cfg.repo.remote).with_context(|| {
         format!(
@@ -380,6 +411,16 @@ pub fn reset(runner: &dyn CommandRunner, cwd: &Utf8Path, cfg: &Config) -> Result
         .transpose()?
         .map(|(m, _)| m);
 
+    let st = git::work_state(runner, &repo_root)?;
+    reporter.event(Event::Target {
+        action: "Resetting",
+        target: &owner_repo,
+        root: &repo_root,
+        branch: &st.branch,
+        commit: &st.commit,
+        dirty: st.dirty,
+    });
+
     let Applied {
         codex_name,
         claude_name,
@@ -390,6 +431,7 @@ pub fn reset(runner: &dyn CommandRunner, cwd: &Utf8Path, cfg: &Config) -> Result
         claude_mkt.as_ref(),
         codex_mkt.as_ref(),
         cfg.targets.claude.scope.as_str(),
+        reporter,
     )?;
 
     Ok(ResetReport {
@@ -719,9 +761,15 @@ mod orchestration_tests {
                 "get-url",
                 CommandOutput::ok("git@github.com:someone/UNRELATED.git"),
             );
-        let err = sync(&r, &f.repo, &f.codex_cfg, &f.cfg)
-            .unwrap_err()
-            .to_string();
+        let err = sync(
+            &r,
+            &f.repo,
+            &f.codex_cfg,
+            &f.cfg,
+            &crate::output::NoopReporter,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             err.to_lowercase().contains("remote"),
             "error should mention remote mismatch: {err}"
@@ -743,7 +791,17 @@ mod orchestration_tests {
         )
         .unwrap();
         let r = happy_runner(&f.repo);
-        let err = format!("{:#}", sync(&r, &f.repo, &f.codex_cfg, &f.cfg).unwrap_err());
+        let err = format!(
+            "{:#}",
+            sync(
+                &r,
+                &f.repo,
+                &f.codex_cfg,
+                &f.cfg,
+                &crate::output::NoopReporter
+            )
+            .unwrap_err()
+        );
         assert!(err.contains("authentication"), "{err}");
         assert!(
             mutating(&r.lines()).is_empty(),
@@ -767,9 +825,15 @@ mod orchestration_tests {
                 "validate",
                 CommandOutput::fail(1, "marketplace.json: invalid"),
             );
-        let err = sync(&r, &f.repo, &f.codex_cfg, &f.cfg)
-            .unwrap_err()
-            .to_string();
+        let err = sync(
+            &r,
+            &f.repo,
+            &f.codex_cfg,
+            &f.cfg,
+            &crate::output::NoopReporter,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.to_lowercase().contains("validat"), "{err}");
         assert!(mutating(&r.lines()).is_empty());
     }
@@ -798,7 +862,14 @@ mod orchestration_tests {
         fake_codex_added(&f.codex_cfg, "M", f.repo.as_str());
         let r = happy_runner(&f.repo);
 
-        let report = sync(&r, &f.repo, &f.codex_cfg, &f.cfg).unwrap();
+        let report = sync(
+            &r,
+            &f.repo,
+            &f.codex_cfg,
+            &f.cfg,
+            &crate::output::NoopReporter,
+        )
+        .unwrap();
 
         let repo = f.repo.as_str();
         assert_eq!(
@@ -830,7 +901,14 @@ mod orchestration_tests {
             CommandOutput::fail(1, "marketplace not found"),
         );
         // A non-zero codex remove must NOT abort the sync.
-        let report = sync(&r, &f.repo, &f.codex_cfg, &f.cfg).unwrap();
+        let report = sync(
+            &r,
+            &f.repo,
+            &f.codex_cfg,
+            &f.cfg,
+            &crate::output::NoopReporter,
+        )
+        .unwrap();
         assert_eq!(report.codex_name.as_deref(), Some("M"));
         assert!(r
             .lines()
@@ -859,7 +937,14 @@ mod orchestration_tests {
                 vec![CommandOutput::ok("[]"), CommandOutput::ok(present)],
             );
 
-        let report = sync(&r, &f.repo, &f.codex_cfg, &f.cfg).unwrap();
+        let report = sync(
+            &r,
+            &f.repo,
+            &f.codex_cfg,
+            &f.cfg,
+            &crate::output::NoopReporter,
+        )
+        .unwrap();
 
         assert_eq!(report.claude_name.as_deref(), Some("M"));
         assert!(
@@ -890,13 +975,54 @@ mod orchestration_tests {
                 |p, a| p == "claude" && a.contains(&"list"),
                 CommandOutput::ok(r#"[{ "name": "M", "installLocation": "/some/STALE/path" }]"#),
             );
-        let err = sync(&r, &f.repo, &f.codex_cfg, &f.cfg)
-            .unwrap_err()
-            .to_string();
+        let err = sync(
+            &r,
+            &f.repo,
+            &f.codex_cfg,
+            &f.cfg,
+            &crate::output::NoopReporter,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("name-identity contract broken"),
             "expected loud identity failure, got: {err}"
         );
+    }
+
+    #[test]
+    fn sync_streams_a_trail_that_survives_a_mid_sequence_failure() {
+        let f = fixture();
+        // Claude install of the *second* plugin fails.
+        let r = RecordingRunner::new()
+            .on_arg("git", "--show-toplevel", CommandOutput::ok(f.repo.as_str()))
+            .on_arg(
+                "git",
+                "get-url",
+                CommandOutput::ok("git@github.com:co/agent-mkt.git"),
+            )
+            .on_arg("claude", "validate", CommandOutput::ok("ok"))
+            .on(
+                |p, a| p == "claude" && a.contains(&"list"),
+                CommandOutput::ok("[]"),
+            )
+            .on(
+                |p, a| {
+                    p == "claude" && a.contains(&"install") && a.iter().any(|x| x.contains("p2@"))
+                },
+                CommandOutput::fail(1, "boom"),
+            );
+        let rep = crate::output::RecordingReporter::default();
+
+        let res = sync(&r, &f.repo, &f.codex_cfg, &f.cfg, &rep);
+
+        assert!(res.is_err(), "sync should fail on plugin 2");
+        let trail = rep.lines.borrow();
+        // The completed steps remain visible; p2 never got a line.
+        assert!(trail.iter().any(|l| l == "Codex   ~ M"), "{trail:?}");
+        assert!(trail.iter().any(|l| l == "Claude  ~ M"), "{trail:?}");
+        assert!(trail.iter().any(|l| l == "+ p1"), "{trail:?}");
+        assert!(!trail.iter().any(|l| l == "+ p2"), "{trail:?}");
     }
 
     fn status_runner(repo: &Utf8Path, origin: &str) -> RecordingRunner {
@@ -954,7 +1080,7 @@ mod orchestration_tests {
                 CommandOutput::ok(r#"[{ "name": "M", "source": "github" }]"#),
             );
 
-        let report = reset(&r, &f.repo, &f.cfg).unwrap();
+        let report = reset(&r, &f.repo, &f.cfg, &crate::output::NoopReporter).unwrap();
 
         assert_eq!(report.owner_repo, "co/agent-mkt");
         assert_eq!(report.plugins, vec!["p1", "p2"]);
@@ -975,23 +1101,21 @@ mod orchestration_tests {
     #[test]
     fn reset_does_not_check_origin_remote() {
         let f = fixture();
-        // No `git get-url` rule scripted: if reset consulted origin this
-        // would still pass, so instead assert reset succeeds without an
-        // origin-mismatch error even though origin is unknowable here.
+        // `git remote get-url origin` *fails* (no origin remote). reset is a
+        // recovery command and must not depend on origin at all — it derives
+        // its target from config, and the progress line uses `work_state`.
         let r = RecordingRunner::new()
             .on_arg("git", "--show-toplevel", CommandOutput::ok(f.repo.as_str()))
             .on_arg(
                 "git",
                 "get-url",
-                CommandOutput::ok("git@github.com:WRONG/WRONG.git"),
+                CommandOutput::fail(2, "error: No such remote 'origin'"),
             )
             .on(
                 |p, a| p == "claude" && a.contains(&"list"),
                 CommandOutput::ok("[]"),
             );
-        // origin says WRONG/WRONG but config says co/agent-mkt — reset must
-        // not care.
-        assert!(reset(&r, &f.repo, &f.cfg).is_ok());
+        assert!(reset(&r, &f.repo, &f.cfg, &crate::output::NoopReporter).is_ok());
     }
 
     #[test]

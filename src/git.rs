@@ -4,7 +4,18 @@ use crate::command::CommandRunner;
 use anyhow::{bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 
-/// Live snapshot of the worktree skillctl is operating on.
+/// Branch / commit / dirty — everything `sync` and `reset` need to announce
+/// the target. Deliberately excludes `origin`: `reset` is a recovery command
+/// that must work in a worktree with no `origin` remote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkState {
+    pub branch: String,
+    pub commit: String,
+    pub dirty: bool,
+}
+
+/// Live snapshot of the worktree skillctl is operating on (adds `origin` on
+/// top of [`WorkState`], for `status`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoState {
     pub root: Utf8PathBuf,
@@ -60,8 +71,8 @@ pub fn default_branch(runner: &dyn CommandRunner, repo: &Utf8Path) -> String {
         .unwrap_or_else(|| "main".to_string())
 }
 
-/// Branch / short-commit / dirty / origin, in one shot, for `status`.
-pub fn state(runner: &dyn CommandRunner, repo: &Utf8Path) -> Result<RepoState> {
+/// Branch / short-commit / dirty — no `origin` lookup.
+pub fn work_state(runner: &dyn CommandRunner, repo: &Utf8Path) -> Result<WorkState> {
     let branch = git(
         runner,
         repo,
@@ -80,12 +91,22 @@ pub fn state(runner: &dyn CommandRunner, repo: &Utf8Path) -> Result<RepoState> {
         &["status", "--porcelain"],
         "git status --porcelain",
     )?;
-    let origin = origin_url(runner, repo)?;
-    Ok(RepoState {
-        root: repo.to_path_buf(),
+    Ok(WorkState {
         branch,
         commit,
         dirty: !porcelain.is_empty(),
+    })
+}
+
+/// [`work_state`] plus `origin`, in one shot, for `status`.
+pub fn state(runner: &dyn CommandRunner, repo: &Utf8Path) -> Result<RepoState> {
+    let w = work_state(runner, repo)?;
+    let origin = origin_url(runner, repo)?;
+    Ok(RepoState {
+        root: repo.to_path_buf(),
+        branch: w.branch,
+        commit: w.commit,
+        dirty: w.dirty,
         origin_url: origin,
     })
 }
