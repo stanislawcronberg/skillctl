@@ -490,7 +490,10 @@ mod tests {
         let txt = plain(&render_init(&report));
         assert!(txt.contains("targets  codex"), "{txt}");
         assert!(txt.contains("skipped  claude — not on PATH"), "{txt}");
-        assert!(!txt.contains("warning:"), "no warning when file present: {txt}");
+        assert!(
+            !txt.contains("warning:"),
+            "no warning when file present: {txt}"
+        );
     }
 
     #[test]
@@ -513,9 +516,18 @@ mod tests {
 
     #[test]
     fn restart_messaging_names_only_the_enabled_runtimes() {
-        assert_eq!(restart_notice(true, true), "not live until you restart Claude and Codex");
-        assert_eq!(restart_notice(false, true), "not live until you restart Codex");
-        assert_eq!(restart_reminder(true, false), "restart Claude after any sync/reset");
+        assert_eq!(
+            restart_notice(true, true),
+            "not live until you restart Claude and Codex"
+        );
+        assert_eq!(
+            restart_notice(false, true),
+            "not live until you restart Codex"
+        );
+        assert_eq!(
+            restart_reminder(true, false),
+            "restart Claude after any sync/reset"
+        );
     }
 
     #[test]
@@ -534,8 +546,10 @@ mod tests {
             plugins: vec!["p1".into()],
             ..codex_only
         };
-        assert!(plain(&sync_summary(&with_plugins, Duration::from_millis(5)))
-            .contains("Synced 1 plugin in"));
+        assert!(
+            plain(&sync_summary(&with_plugins, Duration::from_millis(5)))
+                .contains("Synced 1 plugin in")
+        );
     }
 
     #[test]

@@ -53,11 +53,7 @@ impl Config {
     /// Claude at user scope, each target enabled per the caller's detection /
     /// `--*-only` decision. A disabled target keeps its path so the user can
     /// flip `enabled = true` by hand later without re-running `init`.
-    pub fn new(
-        remote: impl Into<String>,
-        claude_enabled: bool,
-        codex_enabled: bool,
-    ) -> Self {
+    pub fn new(remote: impl Into<String>, claude_enabled: bool, codex_enabled: bool) -> Self {
         Config {
             repo: RepoConfig {
                 remote: remote.into(),
