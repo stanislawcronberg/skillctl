@@ -77,6 +77,10 @@ pub enum Event<'a> {
         commit: &'a str,
         dirty: bool,
     },
+    /// `reset`'s analogue of `Target`: announced before the first mutation.
+    /// `reset` fetches the configured remote's default branch and never
+    /// touches a worktree, so there is no root/branch/commit to show.
+    ResetTarget { source: &'a str },
     /// A runtime's marketplace was (re-)pointed.
     Marketplace { runtime: &'a str, name: &'a str },
     /// A plugin was installed.
@@ -104,6 +108,13 @@ pub fn render_event(e: &Event) -> String {
                 target.bold(),
                 "→".dimmed(),
                 format_args!("{root} · {branch} {}{dirt}", commit.dimmed()),
+            )
+        }
+        Event::ResetTarget { source } => {
+            format!(
+                "\n  {} {}\n",
+                "Resetting".bold(),
+                format_args!("{source} (default branch)").bold(),
             )
         }
         Event::Marketplace { runtime, name } => {
@@ -157,6 +168,9 @@ fn phase_after(e: &Event) -> &'static str {
         // Target is announced before any mutation: next come the marketplace
         // remove/add calls.
         Event::Target { .. } => "linking runtimes…",
+        // reset's pre-mutation announce: the shallow clone already happened
+        // before this fired; the marketplace remove/add calls come next.
+        Event::ResetTarget { .. } => "linking runtimes…",
         // Claude's marketplace is now set → the install fan-out runs next;
         // Codex's marketplace event still precedes Claude's link.
         Event::Marketplace {
@@ -309,25 +323,44 @@ fn row(label: &str, value: impl std::fmt::Display) -> String {
 }
 
 pub fn render_status(s: &StatusReport) -> String {
-    let dirt = if s.repo.dirty {
-        format!(" {}", "(dirty)".yellow())
-    } else {
-        String::new()
-    };
-    let match_line = if s.remote_matches {
-        format!("{} matches configured remote", "✓".green())
-    } else {
-        format!("{} does NOT match configured remote", "✗".red().bold())
-    };
-    let wt = s.repo.root.as_str();
     let mut out = String::from("\n");
-    out.push_str(&row(
-        "worktree",
-        format_args!("{wt} · {} {}{dirt}", s.repo.branch, s.repo.commit.dimmed()),
-    ));
-    out.push_str(&row("remote", &s.configured_remote));
-    out.push_str(&row("origin", &s.repo.origin_url));
-    out.push_str(&format!("{:LABEL_COL$}{match_line}\n", ""));
+
+    // In a repo: the worktree/origin/match block, exactly as before, and the
+    // worktree path is what makes a runtime read "→ this worktree". Outside a
+    // repo: only the configured remote, and an empty `wt` so `same_path`
+    // never yields the (now meaningless) "this worktree".
+    let wt: &str = match &s.snapshot {
+        Some(snap) => {
+            let dirt = if snap.repo.dirty {
+                format!(" {}", "(dirty)".yellow())
+            } else {
+                String::new()
+            };
+            let match_line = if snap.remote_matches {
+                format!("{} matches configured remote", "✓".green())
+            } else {
+                format!("{} does NOT match configured remote", "✗".red().bold())
+            };
+            let wt = snap.repo.root.as_str();
+            out.push_str(&row(
+                "worktree",
+                format_args!(
+                    "{wt} · {} {}{dirt}",
+                    snap.repo.branch,
+                    snap.repo.commit.dimmed()
+                ),
+            ));
+            out.push_str(&row("remote", &s.configured_remote));
+            out.push_str(&row("origin", &snap.repo.origin_url));
+            out.push_str(&format!("{:LABEL_COL$}{match_line}\n", ""));
+            wt
+        }
+        None => {
+            out.push_str(&row("remote", &s.configured_remote));
+            ""
+        }
+    };
+
     out.push_str(&row(
         "Claude",
         target_cell(s.claude_enabled, &s.claude_name, &s.claude_pointed_at, wt),
@@ -336,10 +369,15 @@ pub fn render_status(s: &StatusReport) -> String {
         "Codex",
         target_cell(s.codex_enabled, &s.codex_name, &s.codex_pointed_at, wt),
     ));
+    let default_branch = s
+        .snapshot
+        .as_ref()
+        .map(|snap| snap.default_branch.as_str())
+        .unwrap_or("default branch");
     out.push_str(&format!(
         "\n  {} ({})\n",
         "reset → default branch".dimmed(),
-        s.default_branch
+        default_branch
     ));
     out
 }
@@ -393,6 +431,7 @@ pub fn render_init(report: &InitReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::RepoSnapshot;
     use crate::git::RepoState;
 
     fn plain(s: &str) -> String {
@@ -455,15 +494,17 @@ mod tests {
     fn status_makes_a_remote_mismatch_loud_and_scannable() {
         let s = StatusReport {
             configured_remote: "git@github.com:co/agent-mkt.git".into(),
-            repo: RepoState {
-                root: "/work/wt".into(),
-                branch: "pr-1".into(),
-                commit: "abc1234".into(),
-                dirty: true,
-                origin_url: "git@github.com:other/x.git".into(),
-            },
-            remote_matches: false,
-            default_branch: "main".into(),
+            snapshot: Some(RepoSnapshot {
+                repo: RepoState {
+                    root: "/work/wt".into(),
+                    branch: "pr-1".into(),
+                    commit: "abc1234".into(),
+                    dirty: true,
+                    origin_url: "git@github.com:other/x.git".into(),
+                },
+                remote_matches: false,
+                default_branch: "main".into(),
+            }),
             claude_enabled: true,
             codex_enabled: true,
             claude_name: Some("M".into()),
@@ -495,15 +536,17 @@ mod tests {
     fn status_flags_a_pointed_elsewhere_runtime() {
         let s = StatusReport {
             configured_remote: "r".into(),
-            repo: RepoState {
-                root: "/work/wt".into(),
-                branch: "b".into(),
-                commit: "c".into(),
-                dirty: false,
-                origin_url: "r".into(),
-            },
-            remote_matches: true,
-            default_branch: "main".into(),
+            snapshot: Some(RepoSnapshot {
+                repo: RepoState {
+                    root: "/work/wt".into(),
+                    branch: "b".into(),
+                    commit: "c".into(),
+                    dirty: false,
+                    origin_url: "r".into(),
+                },
+                remote_matches: true,
+                default_branch: "main".into(),
+            }),
             claude_enabled: true,
             codex_enabled: true,
             claude_name: Some("M".into()),
@@ -520,15 +563,17 @@ mod tests {
     fn status_shows_a_disabled_runtime_as_not_managed_not_broken() {
         let s = StatusReport {
             configured_remote: "r".into(),
-            repo: RepoState {
-                root: "/work/wt".into(),
-                branch: "b".into(),
-                commit: "c".into(),
-                dirty: false,
-                origin_url: "r".into(),
-            },
-            remote_matches: true,
-            default_branch: "main".into(),
+            snapshot: Some(RepoSnapshot {
+                repo: RepoState {
+                    root: "/work/wt".into(),
+                    branch: "b".into(),
+                    commit: "c".into(),
+                    dirty: false,
+                    origin_url: "r".into(),
+                },
+                remote_matches: true,
+                default_branch: "main".into(),
+            }),
             claude_enabled: false,
             codex_enabled: true,
             claude_name: None,
@@ -543,6 +588,42 @@ mod tests {
             "disabled must not look broken: {txt}"
         );
         assert!(txt.contains("Codex    M → this worktree"), "{txt}");
+    }
+
+    #[test]
+    fn status_outside_a_repo_render_skips_worktree_rows() {
+        // snapshot: None ⇒ no worktree/origin/match rows, but the configured
+        // remote, both runtime pointers, and the reset line still render.
+        let s = StatusReport {
+            configured_remote: "git@github.com:co/agent-mkt.git".into(),
+            snapshot: None,
+            claude_enabled: true,
+            codex_enabled: true,
+            claude_name: Some("M".into()),
+            codex_name: Some("M".into()),
+            claude_pointed_at: Some("co/agent-mkt".into()),
+            codex_pointed_at: Some("git@github.com:co/agent-mkt.git".into()),
+        };
+        let txt = plain(&render_status(&s));
+        assert!(!txt.contains("worktree"), "no worktree row: {txt}");
+        assert!(!txt.contains("origin"), "no origin row: {txt}");
+        assert!(
+            !txt.contains("configured remote"),
+            "no ✓/✗ match line: {txt}"
+        );
+        assert!(
+            txt.contains("remote   git@github.com:co/agent-mkt.git"),
+            "{txt}"
+        );
+        assert!(txt.contains("Claude   M → co/agent-mkt"), "{txt}");
+        assert!(
+            txt.contains("Codex    M → git@github.com:co/agent-mkt.git"),
+            "{txt}"
+        );
+        assert!(
+            txt.contains("reset → default branch (default branch)"),
+            "{txt}"
+        );
     }
 
     fn outcome(enabled: bool, file: bool, reason: Option<&str>) -> crate::command::TargetOutcome {

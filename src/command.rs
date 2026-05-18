@@ -227,6 +227,84 @@ fn read_market(repo_root: &Utf8Path, rel: &Utf8Path) -> Result<(Marketplace, Str
     Ok((mkt, raw))
 }
 
+/// Source of the two parsed marketplace files `reset` applies. Production
+/// shallow-clones the configured remote's default branch; tests stub it so
+/// the clone + filesystem step never needs real git or a network.
+trait MarketplacePair {
+    /// `(claude, codex)` — each `Some` only when that target is enabled.
+    fn load(&self, cfg: &Config) -> Result<(Option<Marketplace>, Option<Marketplace>)>;
+}
+
+/// Production [`MarketplacePair`]: `git clone --depth 1 -- <remote> <tmp>`
+/// (no `--branch` ⇒ the remote's default branch; host-agnostic for GitHub,
+/// GitLab incl. nested groups, Bitbucket, self-hosted; ssh or https), then
+/// read both marketplace files out of the checkout. The `TempDir` is removed
+/// on drop, *after* the reads.
+struct RemoteClone<'a> {
+    runner: &'a dyn CommandRunner,
+    remote: &'a str,
+}
+
+impl RemoteClone<'_> {
+    /// Clone into `checkout`, then read both marketplace files from it. Split
+    /// from [`MarketplacePair::load`] so a test can drive this read path
+    /// against a pre-populated dir with a scripted-success fake `git clone`.
+    fn load_from(
+        &self,
+        cfg: &Config,
+        checkout: &Utf8Path,
+    ) -> Result<(Option<Marketplace>, Option<Marketplace>)> {
+        let out = self.runner.run(
+            "git",
+            &[
+                "clone",
+                "--depth",
+                "1",
+                "--",
+                self.remote,
+                checkout.as_str(),
+            ],
+            None,
+        )?;
+        if !out.success() {
+            bail!(
+                "git clone of the configured remote failed (could not fetch {}): {}",
+                self.remote,
+                out.stderr.trim()
+            );
+        }
+        let claude = cfg
+            .targets
+            .claude
+            .enabled
+            .then(|| read_market(checkout, &cfg.targets.claude.marketplace_file))
+            .transpose()?
+            .map(|(m, _)| m);
+        let codex = cfg
+            .targets
+            .codex
+            .enabled
+            .then(|| read_market(checkout, &cfg.targets.codex.marketplace_file))
+            .transpose()?
+            .map(|(m, _)| m);
+        Ok((claude, codex))
+    }
+}
+
+impl MarketplacePair for RemoteClone<'_> {
+    fn load(&self, cfg: &Config) -> Result<(Option<Marketplace>, Option<Marketplace>)> {
+        let tmp = tempfile::Builder::new()
+            .prefix("skillctl-reset-")
+            .tempdir()
+            .context("creating a temp dir for the shallow clone")?;
+        let checkout =
+            Utf8Path::from_path(tmp.path()).context("temp dir path is not valid UTF-8")?;
+        let pair = self.load_from(cfg, checkout)?;
+        drop(tmp); // remove the clone now that both files are read
+        Ok(pair)
+    }
+}
+
 /// Everything pre-flight parsed/validated, shared by `sync` and `reset`.
 struct Preflight {
     repo_root: Utf8PathBuf,
@@ -511,27 +589,43 @@ pub fn sync(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResetReport {
-    pub repo_root: Utf8PathBuf,
     pub source: String,
     pub claude_name: Option<String>,
     pub codex_name: Option<String>,
     pub plugins: Vec<String>,
 }
 
-/// `skillctl reset`: point both runtimes back at the configured git remote URL,
-/// which both runtimes resolve to its default branch (works for any host —
-/// GitHub, GitLab including nested groups, Bitbucket, self-hosted).
+/// `skillctl reset`: snap both runtimes back to the configured marketplace's
+/// default branch. It shallow-clones the configured remote (it never reads
+/// the local worktree), so it works from *any* directory and can never
+/// reinstall an uncommitted local plugin set — the plugin list always
+/// matches what the runtimes resolve when pointed at the remote URL.
 /// Codex-first, like `sync`. Claude's `marketplace remove` orphans its
-/// installed plugins, so every plugin is reinstalled afterwards. Recovery
-/// command: it does *not* check the worktree's `origin` or run validators.
+/// installed plugins, so every plugin is reinstalled afterwards. A recovery
+/// command: no `origin` check, no validators, no git worktree required.
 pub fn reset(
     runner: &dyn CommandRunner,
-    cwd: &Utf8Path,
     cfg: &Config,
     reporter: &dyn Reporter,
 ) -> Result<ResetReport> {
+    let pair = RemoteClone {
+        runner,
+        remote: &cfg.repo.remote,
+    };
+    reset_with(runner, cfg, &pair, reporter)
+}
+
+/// `reset` with the marketplace source injected, so tests exercise the
+/// orchestration without real git or a network (see `StubPair`).
+fn reset_with(
+    runner: &dyn CommandRunner,
+    cfg: &Config,
+    source_pair: &dyn MarketplacePair,
+    reporter: &dyn Reporter,
+) -> Result<ResetReport> {
     ensure_any_target(cfg)?;
-    let repo_root = git::repo_root(runner, cwd)?;
+    // Validate the remote shape up-front (single source of the bad-remote
+    // message) — before any temp dir or `git clone` is attempted.
     let source = git::marketplace_source(&cfg.repo.remote).with_context(|| {
         format!(
             "configured remote is not a recognizable git remote: {}",
@@ -539,30 +633,9 @@ pub fn reset(
         )
     })?;
 
-    let claude_mkt = cfg
-        .targets
-        .claude
-        .enabled
-        .then(|| read_market(&repo_root, &cfg.targets.claude.marketplace_file))
-        .transpose()?
-        .map(|(m, _)| m);
-    let codex_mkt = cfg
-        .targets
-        .codex
-        .enabled
-        .then(|| read_market(&repo_root, &cfg.targets.codex.marketplace_file))
-        .transpose()?
-        .map(|(m, _)| m);
+    let (claude_mkt, codex_mkt) = source_pair.load(cfg)?;
 
-    let st = git::work_state(runner, &repo_root)?;
-    reporter.event(Event::Target {
-        action: "Resetting",
-        target: &source,
-        root: &repo_root,
-        branch: &st.branch,
-        commit: &st.commit,
-        dirty: st.dirty,
-    });
+    reporter.event(Event::ResetTarget { source: &source });
 
     let Applied {
         codex_name,
@@ -578,7 +651,6 @@ pub fn reset(
     )?;
 
     Ok(ResetReport {
-        repo_root,
         source,
         claude_name,
         codex_name,
@@ -586,12 +658,20 @@ pub fn reset(
     })
 }
 
+/// The git-repo-dependent half of `status`. `None` when cwd is not inside a
+/// git worktree — `status` must still work from anywhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StatusReport {
-    pub configured_remote: String,
+pub struct RepoSnapshot {
     pub repo: git::RepoState,
     pub remote_matches: bool,
     pub default_branch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusReport {
+    pub configured_remote: String,
+    /// `None` ⇒ not inside a git repo; worktree/origin/match rows are skipped.
+    pub snapshot: Option<RepoSnapshot>,
     /// Whether config manages each runtime — drives the `(not managed)` row.
     pub claude_enabled: bool,
     pub codex_enabled: bool,
@@ -604,37 +684,38 @@ pub struct StatusReport {
 
 /// `skillctl status`: a fully live snapshot (no state file). Best-effort —
 /// missing marketplace files or an unreadable runtime degrade individual
-/// fields to `None` rather than failing the whole command.
+/// fields to `None` rather than failing the whole command. When cwd is not
+/// inside a git repo the worktree/origin half is simply absent
+/// (`snapshot: None`); the configured remote and where each runtime points
+/// are still shown.
 pub fn status(
     runner: &dyn CommandRunner,
     cwd: &Utf8Path,
     codex_config: &Utf8Path,
     cfg: &Config,
 ) -> Result<StatusReport> {
-    let repo_root = git::repo_root(runner, cwd)?;
-    let repo = git::state(runner, &repo_root)?;
-    let default_branch = git::default_branch(runner, &repo_root);
-
-    let remote_matches = {
-        let want = git::canonical_remote_key(&cfg.repo.remote);
-        let got = git::canonical_remote_key(&repo.origin_url);
-        want.is_some() && want == got
+    // Being outside a git repo is not an error here — degrade to `None`. An
+    // in-repo `git::state` failure (e.g. no `origin`) still propagates,
+    // preserving today's in-repo behavior.
+    let snapshot = match git::repo_root(runner, cwd) {
+        Ok(repo_root) => {
+            let repo = git::state(runner, &repo_root)?;
+            let default_branch = git::default_branch(runner, &repo_root);
+            let remote_matches = {
+                let want = git::canonical_remote_key(&cfg.repo.remote);
+                let got = git::canonical_remote_key(&repo.origin_url);
+                want.is_some() && want == got
+            };
+            Some(RepoSnapshot {
+                repo,
+                remote_matches,
+                default_branch,
+            })
+        }
+        Err(_) => None,
     };
 
-    // Best-effort name detection from the worktree's marketplace files.
-    let name_of = |rel: &Utf8Path| read_market(&repo_root, rel).ok().map(|(m, _)| m.name);
-    let claude_name = cfg
-        .targets
-        .claude
-        .enabled
-        .then(|| name_of(&cfg.targets.claude.marketplace_file))
-        .flatten();
-    let codex_name = cfg
-        .targets
-        .codex
-        .enabled
-        .then(|| name_of(&cfg.targets.codex.marketplace_file))
-        .flatten();
+    let (claude_name, codex_name) = resolve_names(runner, codex_config, cfg, snapshot.as_ref());
 
     let claude_pointed_at = claude_name.as_ref().and_then(|name| {
         claude_list(runner)
@@ -652,9 +733,7 @@ pub fn status(
 
     Ok(StatusReport {
         configured_remote: cfg.repo.remote.clone(),
-        repo,
-        remote_matches,
-        default_branch,
+        snapshot,
         claude_enabled: cfg.targets.claude.enabled,
         codex_enabled: cfg.targets.codex.enabled,
         claude_name,
@@ -662,6 +741,61 @@ pub fn status(
         claude_pointed_at,
         codex_pointed_at,
     })
+}
+
+/// Resolve each runtime's marketplace name. In a repo: from the worktree's
+/// marketplace files (unchanged — keeps in-repo output byte-identical).
+/// Outside a repo there is no file, so match a *registered* marketplace
+/// whose source resolves to the configured remote and take its name.
+/// Best-effort: an unmatched runtime degrades to `None`.
+fn resolve_names(
+    runner: &dyn CommandRunner,
+    codex_config: &Utf8Path,
+    cfg: &Config,
+    snapshot: Option<&RepoSnapshot>,
+) -> (Option<String>, Option<String>) {
+    if let Some(snap) = snapshot {
+        let name_of = |rel: &Utf8Path| read_market(&snap.repo.root, rel).ok().map(|(m, _)| m.name);
+        let claude = cfg
+            .targets
+            .claude
+            .enabled
+            .then(|| name_of(&cfg.targets.claude.marketplace_file))
+            .flatten();
+        let codex = cfg
+            .targets
+            .codex
+            .enabled
+            .then(|| name_of(&cfg.targets.codex.marketplace_file))
+            .flatten();
+        return (claude, codex);
+    }
+
+    let want = git::canonical_remote_key(&cfg.repo.remote);
+    let claude = cfg
+        .targets
+        .claude
+        .enabled
+        .then(|| {
+            want.as_ref()?;
+            claude_list(runner).ok()?.into_iter().find_map(|e| {
+                let src = claude::entry_source(&e)?;
+                let key = git::canonical_remote_key(&src).or_else(|| github_owner_repo_key(&src));
+                (key == want).then_some(e.name)
+            })
+        })
+        .flatten();
+    let codex = cfg
+        .targets
+        .codex
+        .enabled
+        .then(|| {
+            codex::find_marketplace_by_source(codex_config, &cfg.repo.remote)
+                .ok()
+                .flatten()
+        })
+        .flatten();
+    (claude, codex)
 }
 
 fn claude_list(runner: &dyn CommandRunner) -> Result<Vec<claude::ClaudeEntry>> {
@@ -677,6 +811,16 @@ fn claude_list(runner: &dyn CommandRunner) -> Result<Vec<claude::ClaudeEntry>> {
 
 fn claude_marketplace_present(runner: &dyn CommandRunner, name: &str) -> Result<bool> {
     Ok(claude_list(runner)?.iter().any(|e| e.name == name))
+}
+
+/// Best-effort canonical key for a Claude github entry whose source is a bare
+/// `owner/repo` (Claude resolves those against github.com).
+/// [`git::canonical_remote_key`] needs a host and returns `None` for a bare
+/// slug — this fills that gap, used only by the outside-a-repo `status` match.
+fn github_owner_repo_key(s: &str) -> Option<String> {
+    let s = s.trim().trim_end_matches('/');
+    (s.matches('/').count() == 1 && !s.contains(':'))
+        .then(|| format!("github.com/{}", s.to_lowercase()))
 }
 
 /// The canonical "do these two paths point at the same worktree" rule,
@@ -1382,10 +1526,11 @@ mod orchestration_tests {
 
         let s = status(&r, &f.repo, &f.codex_cfg, &f.cfg).unwrap();
 
-        assert!(s.remote_matches);
-        assert_eq!(s.repo.branch, "pr-123");
-        assert!(s.repo.dirty);
-        assert_eq!(s.default_branch, "main");
+        let snap = s.snapshot.as_ref().expect("in a repo → snapshot present");
+        assert!(snap.remote_matches);
+        assert_eq!(snap.repo.branch, "pr-123");
+        assert!(snap.repo.dirty);
+        assert_eq!(snap.default_branch, "main");
         assert_eq!(s.claude_name.as_deref(), Some("M"));
         assert_eq!(s.codex_name.as_deref(), Some("M"));
         assert_eq!(s.claude_pointed_at.as_deref(), Some(f.repo.as_str()));
@@ -1397,21 +1542,77 @@ mod orchestration_tests {
         let f = fixture();
         let r = status_runner(&f.repo, "git@github.com:other/unrelated.git");
         let s = status(&r, &f.repo, &f.codex_cfg, &f.cfg).unwrap();
-        assert!(!s.remote_matches);
+        assert!(!s.snapshot.as_ref().expect("in a repo").remote_matches);
+    }
+
+    /// Stub [`MarketplacePair`]: hands `reset_with` canned marketplaces so the
+    /// shallow-clone + filesystem step never needs real git or a network.
+    struct StubPair {
+        claude: Option<Marketplace>,
+        codex: Option<Marketplace>,
+    }
+    impl MarketplacePair for StubPair {
+        fn load(&self, _cfg: &Config) -> Result<(Option<Marketplace>, Option<Marketplace>)> {
+            Ok((self.claude.clone(), self.codex.clone()))
+        }
+    }
+    fn mkt(name: &str, plugins: &[&str]) -> Marketplace {
+        Marketplace {
+            name: name.into(),
+            plugins: plugins.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+    fn both_mkts() -> StubPair {
+        StubPair {
+            claude: Some(mkt("M", &["p1", "p2"])),
+            codex: Some(mkt("M", &["p1", "p2"])),
+        }
+    }
+
+    #[test]
+    fn status_outside_a_repo_degrades_gracefully() {
+        // `git rev-parse --show-toplevel` fails: not in a repo. status must
+        // NOT error — it drops the worktree half and resolves names/pointers
+        // from the live registries via the configured remote.
+        let f = fixture();
+        fake_codex_added(&f.codex_cfg, "M", "git@github.com:co/agent-mkt.git");
+        let r = RecordingRunner::new()
+            .on_arg(
+                "git",
+                "--show-toplevel",
+                CommandOutput::fail(128, "fatal: not a git repository"),
+            )
+            .on(
+                |p, a| p == "claude" && a.contains(&"list"),
+                // A github entry (no installLocation) → entry_source = repo.
+                CommandOutput::ok(
+                    r#"[{ "name": "M", "source": "github", "repo": "co/agent-mkt" }]"#,
+                ),
+            );
+
+        let s = status(&r, &f.repo, &f.codex_cfg, &f.cfg).unwrap();
+
+        assert!(s.snapshot.is_none(), "no snapshot outside a repo");
+        assert_eq!(s.configured_remote, "git@github.com:co/agent-mkt.git");
+        assert_eq!(s.claude_name.as_deref(), Some("M"));
+        assert_eq!(s.codex_name.as_deref(), Some("M"));
+        assert_eq!(s.claude_pointed_at.as_deref(), Some("co/agent-mkt"));
+        assert_eq!(
+            s.codex_pointed_at.as_deref(),
+            Some("git@github.com:co/agent-mkt.git")
+        );
     }
 
     #[test]
     fn reset_points_both_runtimes_at_the_remote_url_and_reinstalls() {
         let f = fixture();
         // Claude already has "M" registered → conditional remove must fire.
-        let r = RecordingRunner::new()
-            .on_arg("git", "--show-toplevel", CommandOutput::ok(f.repo.as_str()))
-            .on(
-                |p, a| p == "claude" && a.contains(&"list"),
-                CommandOutput::ok(r#"[{ "name": "M", "source": "github" }]"#),
-            );
+        let r = RecordingRunner::new().on(
+            |p, a| p == "claude" && a.contains(&"list"),
+            CommandOutput::ok(r#"[{ "name": "M", "source": "github" }]"#),
+        );
 
-        let report = reset(&r, &f.repo, &f.cfg, &crate::output::NoopReporter).unwrap();
+        let report = reset_with(&r, &f.cfg, &both_mkts(), &crate::output::NoopReporter).unwrap();
 
         assert_eq!(report.source, "git@github.com:co/agent-mkt.git");
         assert_eq!(report.plugins, vec!["p1", "p2"]);
@@ -1449,14 +1650,12 @@ mod orchestration_tests {
         let url = "git@gitlab.com:company/team/agent-marketplace.git";
         let mut f = fixture();
         f.cfg = Config::new(url, true, true);
-        let r = RecordingRunner::new()
-            .on_arg("git", "--show-toplevel", CommandOutput::ok(f.repo.as_str()))
-            .on(
-                |p, a| p == "claude" && a.contains(&"list"),
-                CommandOutput::ok("[]"),
-            );
+        let r = RecordingRunner::new().on(
+            |p, a| p == "claude" && a.contains(&"list"),
+            CommandOutput::ok("[]"),
+        );
 
-        let report = reset(&r, &f.repo, &f.cfg, &crate::output::NoopReporter).unwrap();
+        let report = reset_with(&r, &f.cfg, &both_mkts(), &crate::output::NoopReporter).unwrap();
 
         assert_eq!(report.source, url);
         let lines = agent_lines(&r.lines());
@@ -1471,23 +1670,92 @@ mod orchestration_tests {
     }
 
     #[test]
-    fn reset_does_not_check_origin_remote() {
+    fn reset_makes_no_git_calls_so_it_works_without_a_repo() {
+        // reset is a recovery command: it derives its target from config and
+        // (in production) shallow-clones the remote. With the source stubbed
+        // it must touch git *zero* times — proving it can't depend on cwd,
+        // an `origin` remote, or being inside a worktree at all.
         let f = fixture();
-        // `git remote get-url origin` *fails* (no origin remote). reset is a
-        // recovery command and must not depend on origin at all — it derives
-        // its target from config, and the progress line uses `work_state`.
-        let r = RecordingRunner::new()
-            .on_arg("git", "--show-toplevel", CommandOutput::ok(f.repo.as_str()))
-            .on_arg(
-                "git",
-                "get-url",
-                CommandOutput::fail(2, "error: No such remote 'origin'"),
-            )
-            .on(
-                |p, a| p == "claude" && a.contains(&"list"),
-                CommandOutput::ok("[]"),
-            );
-        assert!(reset(&r, &f.repo, &f.cfg, &crate::output::NoopReporter).is_ok());
+        let r = RecordingRunner::new().on(
+            |p, a| p == "claude" && a.contains(&"list"),
+            CommandOutput::ok("[]"),
+        );
+        assert!(reset_with(&r, &f.cfg, &both_mkts(), &crate::output::NoopReporter).is_ok());
+        assert!(
+            !r.lines().iter().any(|l| l.starts_with("git ")),
+            "reset must make no git calls, saw: {:?}",
+            r.lines()
+        );
+    }
+
+    #[test]
+    fn reset_clone_command_is_shaped_correctly() {
+        // The real `RemoteClone` read path: a scripted-success `git clone`
+        // plus a pre-populated checkout dir (the fake runner writes no
+        // files, so `load_from` is pointed at a dir we populate ourselves).
+        let (_d, dir) = tmp();
+        std::fs::create_dir_all(dir.join(".claude-plugin")).unwrap();
+        std::fs::create_dir_all(dir.join(".agents/plugins")).unwrap();
+        std::fs::write(dir.join(".claude-plugin/marketplace.json"), CLAUDE_MKT).unwrap();
+        std::fs::write(dir.join(".agents/plugins/marketplace.json"), CODEX_MKT).unwrap();
+        let cfg = Config::new("git@github.com:co/agent-mkt.git", true, true);
+        let r = RecordingRunner::new().on(
+            |p, a| p == "git" && a.contains(&"clone"),
+            CommandOutput::ok(""),
+        );
+
+        let clone = RemoteClone {
+            runner: &r,
+            remote: "git@github.com:co/agent-mkt.git",
+        };
+        let (claude, codex) = clone.load_from(&cfg, &dir).unwrap();
+
+        assert_eq!(
+            r.lines(),
+            vec![format!(
+                "git clone --depth 1 -- git@github.com:co/agent-mkt.git {dir}"
+            )]
+        );
+        assert_eq!(claude.unwrap().plugins, vec!["p1", "p2"]);
+        assert_eq!(codex.unwrap().name, "M");
+    }
+
+    #[test]
+    fn reset_surfaces_a_clear_error_when_clone_fails() {
+        let (_d, dir) = tmp();
+        let cfg = Config::new("git@github.com:co/agent-mkt.git", true, true);
+        let r = RecordingRunner::new().on(
+            |p, a| p == "git" && a.contains(&"clone"),
+            CommandOutput::fail(128, "fatal: Could not read from remote repository"),
+        );
+        let clone = RemoteClone {
+            runner: &r,
+            remote: "git@github.com:co/agent-mkt.git",
+        };
+        let err = clone.load_from(&cfg, &dir).unwrap_err().to_string();
+        assert!(err.contains("git clone"), "{err}");
+        assert!(err.contains("git@github.com:co/agent-mkt.git"), "{err}");
+        assert!(
+            err.contains("Could not read from remote repository"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn reset_rejects_an_unrecognizable_remote_before_cloning() {
+        // A bad remote must fail at validation, before any temp dir or clone.
+        let mut f = fixture();
+        f.cfg = Config::new("not-a-remote", true, true);
+        let r = RecordingRunner::new();
+        let err = reset(&r, &f.cfg, &crate::output::NoopReporter)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a recognizable git remote"), "{err}");
+        assert!(
+            !r.lines().iter().any(|l| l.contains("git clone")),
+            "no clone may be attempted for a bad remote: {:?}",
+            r.lines()
+        );
     }
 
     #[test]

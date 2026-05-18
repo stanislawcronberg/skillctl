@@ -120,10 +120,9 @@ pub fn run() -> Result<()> {
         }
         Command::Reset => {
             let cfg = load_config()?;
-            let cwd = cwd()?;
             let reporter = make_reporter();
             let start = Instant::now();
-            let result = command::reset(&runner, &cwd, &cfg, reporter.as_ref());
+            let result = command::reset(&runner, &cfg, reporter.as_ref());
             let elapsed = start.elapsed();
             reporter.finish();
             let report = result?;
@@ -141,7 +140,7 @@ pub fn run() -> Result<()> {
             let cfg = load_config()?;
             let report = command::status(&runner, &cwd()?, &codex_config_path()?, &cfg)?;
             emit(&output::render_status(&report))?;
-            if !report.remote_matches {
+            if matches!(&report.snapshot, Some(s) if !s.remote_matches) {
                 anstream::eprintln!(
                     "  {}",
                     output::hint(
