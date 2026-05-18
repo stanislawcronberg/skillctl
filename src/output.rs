@@ -171,6 +171,17 @@ fn phase_after(e: &Event) -> &'static str {
 impl ProgressReporter {
     pub fn new() -> Self {
         let bar = indicatif::ProgressBar::new_spinner();
+        // indicatif's default spinner is a *sparse* Braille set whose single
+        // lit dot bounces between the top and bottom rows of the character
+        // cell, so it reads as floating above the baseline of the message
+        // beside it. These ten frames each light a full edge of the cell, so
+        // the glyph stays vertically centered and steady next to the text.
+        // The trailing entry is indicatif's "finished" frame (unused — we
+        // `finish_and_clear`); it only has to exist so the set has > 1 entry.
+        bar.set_style(
+            indicatif::ProgressStyle::default_spinner()
+                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", " "]),
+        );
         bar.enable_steady_tick(Duration::from_millis(100));
         // The longest silent stretch in `sync` is pre-flight's `claude plugin
         // validate`, which runs before the first event; `reset` only reads &

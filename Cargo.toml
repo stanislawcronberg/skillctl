@@ -20,9 +20,13 @@ dirs = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-# Spinner only — the core `ProgressBar` API is not feature-gated, so skip the
-# default `unicode-width`/`wasmbind` features to keep the dep tree lean.
-indicatif = { version = "0.18", default-features = false }
+# Spinner only. `wasmbind` is irrelevant to a native CLI, but `unicode-width`
+# is *not* optional in practice: it gates display-width measurement in both
+# indicatif and its `console` backend, which the in-place spinner redraw uses
+# to clear the right number of cells. Without it, the multi-byte tick glyphs
+# and the `…`/`→`/`✓` in our streamed trail corrupt the redraw. Keep it lean
+# (no `wasmbind`) but keep the width math correct.
+indicatif = { version = "0.18", default-features = false, features = ["unicode-width"] }
 
 [dev-dependencies]
 tempfile = "3"
