@@ -117,6 +117,12 @@ pub fn run() -> Result<()> {
                     cfg.targets.codex.enabled
                 )
             );
+            if !report.codex_unactivated_plugins.is_empty() {
+                anstream::eprintln!(
+                    "{}",
+                    output::codex_unactivated_warning(&report.codex_unactivated_plugins)
+                );
+            }
         }
         Command::Reset => {
             let cfg = load_config()?;
@@ -135,6 +141,12 @@ pub fn run() -> Result<()> {
                     cfg.targets.codex.enabled
                 )
             );
+            if !report.codex_unactivated_plugins.is_empty() {
+                anstream::eprintln!(
+                    "{}",
+                    output::codex_unactivated_warning(&report.codex_unactivated_plugins)
+                );
+            }
         }
         Command::Status => {
             let cfg = load_config()?;

@@ -215,6 +215,10 @@ pub struct SyncReport {
     pub claude_name: Option<String>,
     pub codex_name: Option<String>,
     pub plugins: Vec<String>,
+    /// Codex plugins that registered but won't auto-install because their
+    /// `policy.installation` is not `INSTALLED_BY_DEFAULT` — surfaced as a
+    /// post-sync advisory (skillctl cannot install Codex plugins itself).
+    pub codex_unactivated_plugins: Vec<String>,
 }
 
 /// Read and structurally parse one marketplace file under `repo_root`,
@@ -227,12 +231,21 @@ fn read_market(repo_root: &Utf8Path, rel: &Utf8Path) -> Result<(Marketplace, Str
     Ok((mkt, raw))
 }
 
-/// Source of the two parsed marketplace files `reset` applies. Production
+/// What `reset` needs from the marketplace source: the two parsed
+/// marketplaces (each `Some` only when that target is enabled) plus the
+/// Codex plugins that won't auto-install (see [`codex::installation_advisory`]).
+#[derive(Debug)]
+struct LoadedMarketplaces {
+    claude: Option<Marketplace>,
+    codex: Option<Marketplace>,
+    codex_unactivated: Vec<String>,
+}
+
+/// Source of the parsed marketplace files `reset` applies. Production
 /// shallow-clones the configured remote's default branch; tests stub it so
 /// the clone + filesystem step never needs real git or a network.
 trait MarketplacePair {
-    /// `(claude, codex)` — each `Some` only when that target is enabled.
-    fn load(&self, cfg: &Config) -> Result<(Option<Marketplace>, Option<Marketplace>)>;
+    fn load(&self, cfg: &Config) -> Result<LoadedMarketplaces>;
 }
 
 /// Production [`MarketplacePair`]: `git clone --depth 1 -- <remote> <tmp>`
@@ -249,11 +262,7 @@ impl RemoteClone<'_> {
     /// Clone into `checkout`, then read both marketplace files from it. Split
     /// from [`MarketplacePair::load`] so a test can drive this read path
     /// against a pre-populated dir with a scripted-success fake `git clone`.
-    fn load_from(
-        &self,
-        cfg: &Config,
-        checkout: &Utf8Path,
-    ) -> Result<(Option<Marketplace>, Option<Marketplace>)> {
+    fn load_from(&self, cfg: &Config, checkout: &Utf8Path) -> Result<LoadedMarketplaces> {
         let out = self.runner.run(
             "git",
             &[
@@ -280,28 +289,32 @@ impl RemoteClone<'_> {
             .then(|| read_market(checkout, &cfg.targets.claude.marketplace_file))
             .transpose()?
             .map(|(m, _)| m);
-        let codex = cfg
-            .targets
-            .codex
-            .enabled
-            .then(|| read_market(checkout, &cfg.targets.codex.marketplace_file))
-            .transpose()?
-            .map(|(m, _)| m);
-        Ok((claude, codex))
+        let (codex, codex_unactivated) = if cfg.targets.codex.enabled {
+            let (m, raw) = read_market(checkout, &cfg.targets.codex.marketplace_file)?;
+            let unactivated = codex::installation_advisory(&raw)?;
+            (Some(m), unactivated)
+        } else {
+            (None, Vec::new())
+        };
+        Ok(LoadedMarketplaces {
+            claude,
+            codex,
+            codex_unactivated,
+        })
     }
 }
 
 impl MarketplacePair for RemoteClone<'_> {
-    fn load(&self, cfg: &Config) -> Result<(Option<Marketplace>, Option<Marketplace>)> {
+    fn load(&self, cfg: &Config) -> Result<LoadedMarketplaces> {
         let tmp = tempfile::Builder::new()
             .prefix("skillctl-reset-")
             .tempdir()
             .context("creating a temp dir for the shallow clone")?;
         let checkout =
             Utf8Path::from_path(tmp.path()).context("temp dir path is not valid UTF-8")?;
-        let pair = self.load_from(cfg, checkout)?;
+        let loaded = self.load_from(cfg, checkout)?;
         drop(tmp); // remove the clone now that both files are read
-        Ok(pair)
+        Ok(loaded)
     }
 }
 
@@ -310,6 +323,9 @@ struct Preflight {
     repo_root: Utf8PathBuf,
     claude_mkt: Option<Marketplace>,
     codex_mkt: Option<Marketplace>,
+    /// Codex plugins that will register but not auto-install (not
+    /// `INSTALLED_BY_DEFAULT`). Empty when Codex is disabled.
+    codex_unactivated: Vec<String>,
 }
 
 /// Detect the repo, prove `origin` matches the configured remote, parse both
@@ -353,9 +369,12 @@ fn preflight(
         None
     };
 
+    let mut codex_unactivated = Vec::new();
     let codex_mkt = if cfg.targets.codex.enabled {
         let (mkt, raw) = read_market(&repo_root, &cfg.targets.codex.marketplace_file)?;
         codex::validate_marketplace_json(&raw)
+            .with_context(|| format!("in {}", cfg.targets.codex.marketplace_file))?;
+        codex_unactivated = codex::installation_advisory(&raw)
             .with_context(|| format!("in {}", cfg.targets.codex.marketplace_file))?;
         Some(mkt)
     } else {
@@ -366,6 +385,7 @@ fn preflight(
         repo_root,
         claude_mkt,
         codex_mkt,
+        codex_unactivated,
     })
 }
 
@@ -516,6 +536,7 @@ pub fn sync(
     ensure_any_target(cfg)?;
     let pre = preflight(runner, cwd, cfg, true)?;
     let repo_root = pre.repo_root;
+    let codex_unactivated = pre.codex_unactivated;
     let src = repo_root.as_str();
 
     // Announce the target *now* — after validation, before the first
@@ -584,6 +605,7 @@ pub fn sync(
         claude_name,
         codex_name,
         plugins,
+        codex_unactivated_plugins: codex_unactivated,
     })
 }
 
@@ -593,6 +615,10 @@ pub struct ResetReport {
     pub claude_name: Option<String>,
     pub codex_name: Option<String>,
     pub plugins: Vec<String>,
+    /// Codex plugins that registered but won't auto-install because their
+    /// `policy.installation` is not `INSTALLED_BY_DEFAULT` — surfaced as a
+    /// post-reset advisory (skillctl cannot install Codex plugins itself).
+    pub codex_unactivated_plugins: Vec<String>,
 }
 
 /// `skillctl reset`: snap both runtimes back to the configured marketplace's
@@ -633,7 +659,11 @@ fn reset_with(
         )
     })?;
 
-    let (claude_mkt, codex_mkt) = source_pair.load(cfg)?;
+    let LoadedMarketplaces {
+        claude: claude_mkt,
+        codex: codex_mkt,
+        codex_unactivated,
+    } = source_pair.load(cfg)?;
 
     reporter.event(Event::ResetTarget { source: &source });
 
@@ -655,6 +685,7 @@ fn reset_with(
         claude_name,
         codex_name,
         plugins,
+        codex_unactivated_plugins: codex_unactivated,
     })
 }
 
@@ -1285,6 +1316,41 @@ mod orchestration_tests {
         assert_eq!(report.claude_name.as_deref(), Some("M"));
         assert_eq!(report.codex_name.as_deref(), Some("M"));
         assert_eq!(report.plugins, vec!["p1", "p2"]);
+        // CODEX_MKT sets no `policy.installation` ⇒ Codex registers the
+        // marketplace but won't auto-install these; the advisory surfaces
+        // them and the sync still succeeds (non-fatal).
+        assert_eq!(report.codex_unactivated_plugins, vec!["p1", "p2"]);
+    }
+
+    #[test]
+    fn sync_codex_advisory_is_empty_when_all_installed_by_default() {
+        let f = fixture();
+        std::fs::write(
+            f.repo.join(".agents/plugins/marketplace.json"),
+            r#"{ "name": "M", "plugins": [
+                { "name": "p1", "policy": { "authentication": "ON_INSTALL",
+                  "installation": "INSTALLED_BY_DEFAULT" } },
+                { "name": "p2", "policy": { "authentication": "ON_INSTALL",
+                  "installation": "INSTALLED_BY_DEFAULT" } } ] }"#,
+        )
+        .unwrap();
+        fake_codex_added(&f.codex_cfg, "M", f.repo.as_str());
+        let r = happy_runner(&f.repo);
+
+        let report = sync(
+            &r,
+            &f.repo,
+            &f.codex_cfg,
+            &f.cfg,
+            &crate::output::NoopReporter,
+        )
+        .unwrap();
+
+        assert!(
+            report.codex_unactivated_plugins.is_empty(),
+            "INSTALLED_BY_DEFAULT ⇒ no advisory, got: {:?}",
+            report.codex_unactivated_plugins
+        );
     }
 
     #[test]
@@ -1550,10 +1616,15 @@ mod orchestration_tests {
     struct StubPair {
         claude: Option<Marketplace>,
         codex: Option<Marketplace>,
+        codex_unactivated: Vec<String>,
     }
     impl MarketplacePair for StubPair {
-        fn load(&self, _cfg: &Config) -> Result<(Option<Marketplace>, Option<Marketplace>)> {
-            Ok((self.claude.clone(), self.codex.clone()))
+        fn load(&self, _cfg: &Config) -> Result<LoadedMarketplaces> {
+            Ok(LoadedMarketplaces {
+                claude: self.claude.clone(),
+                codex: self.codex.clone(),
+                codex_unactivated: self.codex_unactivated.clone(),
+            })
         }
     }
     fn mkt(name: &str, plugins: &[&str]) -> Marketplace {
@@ -1566,6 +1637,7 @@ mod orchestration_tests {
         StubPair {
             claude: Some(mkt("M", &["p1", "p2"])),
             codex: Some(mkt("M", &["p1", "p2"])),
+            codex_unactivated: Vec::new(),
         }
     }
 
@@ -1708,7 +1780,7 @@ mod orchestration_tests {
             runner: &r,
             remote: "git@github.com:co/agent-mkt.git",
         };
-        let (claude, codex) = clone.load_from(&cfg, &dir).unwrap();
+        let loaded = clone.load_from(&cfg, &dir).unwrap();
 
         assert_eq!(
             r.lines(),
@@ -1716,8 +1788,11 @@ mod orchestration_tests {
                 "git clone --depth 1 -- git@github.com:co/agent-mkt.git {dir}"
             )]
         );
-        assert_eq!(claude.unwrap().plugins, vec!["p1", "p2"]);
-        assert_eq!(codex.unwrap().name, "M");
+        assert_eq!(loaded.claude.unwrap().plugins, vec!["p1", "p2"]);
+        assert_eq!(loaded.codex.unwrap().name, "M");
+        // CODEX_MKT declares no `policy.installation` ⇒ every plugin is
+        // available-but-not-installed; the advisory must surface them.
+        assert_eq!(loaded.codex_unactivated, vec!["p1", "p2"]);
     }
 
     #[test]

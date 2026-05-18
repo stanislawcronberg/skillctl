@@ -84,6 +84,7 @@ struct RawCodexPlugin {
 #[derive(Deserialize)]
 struct RawPolicy {
     authentication: Option<String>,
+    installation: Option<String>,
 }
 
 /// Codex's only real validator is its *destructive* `add`. Before we let it
@@ -113,6 +114,41 @@ pub fn validate_marketplace_json(json: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Codex registers a marketplace but only *auto-installs* a plugin when its
+/// `policy.installation` is `INSTALLED_BY_DEFAULT`. With the default
+/// `AVAILABLE` (or absent, or any other value) Codex leaves the plugin
+/// merely *available* — registered/enabled but not installed, so its skills
+/// never load. skillctl has no way to install them (Codex has no per-plugin
+/// install command, and `marketplace upgrade` rejects local marketplaces),
+/// so the honest thing is to name them loudly. Returns the plugin names that
+/// will be *available but not installed*; `NOT_AVAILABLE` plugins are
+/// deliberately hidden by the author and are not reported.
+pub fn installation_advisory(json: &str) -> Result<Vec<String>> {
+    let raw: RawCodexMarketplace =
+        serde_json::from_str(json).context("parsing Codex marketplace.json")?;
+
+    let mut not_installed = Vec::new();
+    for (i, plugin) in raw.plugins.iter().enumerate() {
+        let installation = plugin
+            .policy
+            .as_ref()
+            .and_then(|p| p.installation.as_deref());
+        match installation {
+            Some("INSTALLED_BY_DEFAULT") | Some("NOT_AVAILABLE") => {}
+            // None ⇒ defaults to AVAILABLE; "AVAILABLE" or any unknown value
+            // ⇒ not auto-installed.
+            _ => {
+                let name = plugin
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("plugins[{i}]"));
+                not_installed.push(name);
+            }
+        }
+    }
+    Ok(not_installed)
 }
 
 #[cfg(test)]
@@ -217,5 +253,31 @@ source = "git@github.com:other/thing.git"
             err.contains("ON_INSTALL"),
             "should name allowed values: {err}"
         );
+    }
+
+    #[test]
+    fn installation_advisory_lists_only_not_auto_installed_plugins() {
+        let json = r#"{ "name": "M", "plugins": [
+            { "name": "p1", "policy": { "installation": "AVAILABLE" } },
+            { "name": "p2", "policy": { "installation": "INSTALLED_BY_DEFAULT" } },
+            { "name": "p3" },
+            { "name": "p4", "policy": { "installation": "NOT_AVAILABLE" } },
+            { "name": "p5", "policy": { "installation": "WAT" } }
+        ] }"#;
+        // p1 (AVAILABLE) + p3 (absent ⇒ defaults to AVAILABLE) + p5 (unknown)
+        // are available-but-not-installed. p2 auto-installs; p4 is hidden.
+        assert_eq!(
+            installation_advisory(json).unwrap(),
+            vec!["p1".to_string(), "p3".to_string(), "p5".to_string()]
+        );
+    }
+
+    #[test]
+    fn installation_advisory_empty_when_all_installed_by_default() {
+        let json = r#"{ "name": "M", "plugins": [
+            { "name": "p1", "policy": { "installation": "INSTALLED_BY_DEFAULT" } },
+            { "name": "p2", "policy": { "installation": "INSTALLED_BY_DEFAULT" } }
+        ] }"#;
+        assert!(installation_advisory(json).unwrap().is_empty());
     }
 }

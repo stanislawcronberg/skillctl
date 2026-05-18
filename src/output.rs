@@ -283,6 +283,31 @@ pub fn reset_summary(source: &str, took: Duration, claude: bool, codex: bool) ->
     )
 }
 
+/// Post-sync/-reset advisory. Codex registered the marketplace but these
+/// plugins won't auto-install because their `policy.installation` is not
+/// `INSTALLED_BY_DEFAULT` — Codex leaves them *available but not installed*,
+/// so their skills never load. skillctl cannot install Codex plugins itself
+/// (Codex has no per-plugin install command), so name them and point at the
+/// fix, which lives in the marketplace's own `marketplace.json`.
+pub fn codex_unactivated_warning(plugins: &[String]) -> String {
+    let n = plugins.len();
+    let names = plugins.join(", ");
+    format!(
+        "  {}\n  {}",
+        warning(&format!(
+            "Codex registered the marketplace but {n} plugin{} {} \
+             \"available\", not installed: {names}",
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "is" } else { "are" },
+        )),
+        hint(
+            "set \"installation\": \"INSTALLED_BY_DEFAULT\" on each in the \
+             Codex marketplace.json — skillctl can't install Codex plugins \
+             (Codex has no per-plugin install command)"
+        ),
+    )
+}
+
 // --- status (stdout) --------------------------------------------------------
 
 /// One status row's value: a disabled target reads as a deliberate
@@ -685,6 +710,7 @@ mod tests {
             claude_name: None,
             codex_name: Some("M".into()),
             plugins: vec![],
+            codex_unactivated_plugins: vec![],
         };
         // Codex-only: no plugins counted, restart clause names only Codex.
         let txt = plain(&sync_summary(
@@ -709,6 +735,22 @@ mod tests {
         ));
         assert!(txt.contains("Synced 1 plugin in"), "{txt}");
         assert!(txt.contains("— restart Claude and Codex to load"), "{txt}");
+    }
+
+    #[test]
+    fn codex_unactivated_warning_names_plugins_and_the_fix() {
+        let txt = plain(&codex_unactivated_warning(&["alpha".into(), "beta".into()]));
+        assert!(txt.contains("warning:"), "{txt}");
+        assert!(
+            txt.contains("2 plugins are \"available\", not installed"),
+            "{txt}"
+        );
+        assert!(txt.contains("alpha, beta"), "{txt}");
+        assert!(txt.contains("hint:"), "{txt}");
+        assert!(txt.contains("INSTALLED_BY_DEFAULT"), "{txt}");
+        // Singular agreement.
+        let one = plain(&codex_unactivated_warning(&["solo".into()]));
+        assert!(one.contains("1 plugin is \"available\""), "{one}");
     }
 
     #[test]
