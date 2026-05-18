@@ -79,6 +79,10 @@ marketplace_file = ".agents/plugins/marketplace.json"
 `sync` refuses to run if the worktree's `origin` doesn't match the configured
 `remote` (compared canonically, so `git@`/`https`/`ssh` forms all match).
 
+Any git host works — GitHub, GitLab (including nested groups/subgroups),
+Bitbucket, or self-hosted — because `reset` registers the configured remote URL
+as-is and both runtimes resolve a ref-less git URL to its default branch.
+
 ## License
 
 [MIT](LICENSE) © stanislawcronberg

@@ -111,10 +111,7 @@ pub fn run() -> Result<()> {
             let cfg = load_config()?;
             let start = Instant::now();
             let report = command::reset(&runner, &cwd()?, &cfg, &reporter)?;
-            anstream::eprintln!(
-                "{}",
-                output::reset_summary(&report.owner_repo, start.elapsed())
-            );
+            anstream::eprintln!("{}", output::reset_summary(&report.source, start.elapsed()));
             anstream::eprintln!(
                 "  {}",
                 output::warning(&output::restart_notice(

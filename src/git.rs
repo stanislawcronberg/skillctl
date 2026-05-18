@@ -230,8 +230,8 @@ pub fn canonical_remote_key(url: &str) -> Option<String> {
     Some(format!("{host}/{path}").to_lowercase())
 }
 
-/// The `owner/repo` slug for a remote, used as the `add` source on `reset`
-/// (both runtimes accept `owner/repo` and track its default branch).
+/// The `owner/repo` slug for a remote. Used only as a cosmetic short label by
+/// `sync` (which falls back to the full remote for non-`owner/repo` hosts).
 pub fn owner_repo(url: &str) -> Option<String> {
     let key = canonical_remote_key(url)?; // host/owner/repo
     let mut segs = key.split('/');
@@ -242,6 +242,17 @@ pub fn owner_repo(url: &str) -> Option<String> {
         return None;
     }
     Some(format!("{owner}/{repo}"))
+}
+
+/// The git URL to register as the marketplace source on `reset`: the configured
+/// remote verbatim (trimmed), for *any* host. Both Claude and Codex accept full
+/// SSH/HTTPS git URLs (GitHub, GitLab including nested groups, Bitbucket,
+/// self-hosted) and resolve a ref-less URL to its default branch — unlike a
+/// bare `owner/repo` slug, which both runtimes resolve against github.com only.
+/// `None` when the remote is not a recognizable git remote.
+pub fn marketplace_source(url: &str) -> Option<String> {
+    canonical_remote_key(url)?; // validate it parses as host/owner/...
+    Some(url.trim().to_string())
 }
 
 #[cfg(test)]
@@ -287,5 +298,30 @@ mod tests {
             canonical_remote_key("git@github.com:company/agent-marketplace.git"),
             canonical_remote_key("git@github.com:company/other-repo.git")
         );
+    }
+
+    #[test]
+    fn marketplace_source_is_the_remote_verbatim_for_any_host() {
+        for url in [
+            "git@github.com:co/repo.git",
+            "https://github.com/co/repo",
+            "git@gitlab.com:owner/repo.git",
+            // A nested GitLab group/subgroup/repo (>3 path segments).
+            "git@gitlab.com:company/team/agent-marketplace.git",
+            "https://git.example.com/team/tools.git",
+        ] {
+            assert_eq!(marketplace_source(url).as_deref(), Some(url));
+        }
+        // Surrounding whitespace is trimmed.
+        assert_eq!(
+            marketplace_source("  git@gitlab.com:a/b/c.git\n").as_deref(),
+            Some("git@gitlab.com:a/b/c.git")
+        );
+    }
+
+    #[test]
+    fn marketplace_source_rejects_an_unrecognizable_remote() {
+        assert_eq!(marketplace_source(""), None);
+        assert_eq!(marketplace_source("not-a-remote"), None);
     }
 }

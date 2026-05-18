@@ -184,11 +184,11 @@ pub fn sync_summary(report: &SyncReport, took: Duration) -> String {
     )
 }
 
-pub fn reset_summary(owner_repo: &str, took: Duration) -> String {
+pub fn reset_summary(source: &str, took: Duration) -> String {
     format!(
         "\n  {} {} in {}",
         "Reset".green().bold(),
-        format_args!("→ {owner_repo} (default branch)").bold(),
+        format_args!("→ {source} (default branch)").bold(),
         elapsed(took).dimmed()
     )
 }

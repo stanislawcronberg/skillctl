@@ -472,14 +472,15 @@ pub fn sync(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResetReport {
     pub repo_root: Utf8PathBuf,
-    pub owner_repo: String,
+    pub source: String,
     pub claude_name: Option<String>,
     pub codex_name: Option<String>,
     pub plugins: Vec<String>,
 }
 
-/// `skillctl reset`: point both runtimes back at the configured repo's default
-/// branch (`owner/repo`, which both runtimes track at its default branch).
+/// `skillctl reset`: point both runtimes back at the configured git remote URL,
+/// which both runtimes resolve to its default branch (works for any host —
+/// GitHub, GitLab including nested groups, Bitbucket, self-hosted).
 /// Codex-first, like `sync`. Claude's `marketplace remove` orphans its
 /// installed plugins, so every plugin is reinstalled afterwards. Recovery
 /// command: it does *not* check the worktree's `origin` or run validators.
@@ -491,9 +492,9 @@ pub fn reset(
 ) -> Result<ResetReport> {
     ensure_any_target(cfg)?;
     let repo_root = git::repo_root(runner, cwd)?;
-    let owner_repo = git::owner_repo(&cfg.repo.remote).with_context(|| {
+    let source = git::marketplace_source(&cfg.repo.remote).with_context(|| {
         format!(
-            "configured remote is not an owner/repo remote: {}",
+            "configured remote is not a recognizable git remote: {}",
             cfg.repo.remote
         )
     })?;
@@ -516,7 +517,7 @@ pub fn reset(
     let st = git::work_state(runner, &repo_root)?;
     reporter.event(Event::Target {
         action: "Resetting",
-        target: &owner_repo,
+        target: &source,
         root: &repo_root,
         branch: &st.branch,
         commit: &st.commit,
@@ -529,7 +530,7 @@ pub fn reset(
         plugins,
     } = apply_marketplace(
         runner,
-        &owner_repo,
+        &source,
         claude_mkt.as_ref(),
         codex_mkt.as_ref(),
         cfg.targets.claude.scope.as_str(),
@@ -538,7 +539,7 @@ pub fn reset(
 
     Ok(ResetReport {
         repo_root,
-        owner_repo,
+        source,
         claude_name,
         codex_name,
         plugins,
@@ -1179,7 +1180,7 @@ mod orchestration_tests {
     }
 
     #[test]
-    fn reset_points_both_runtimes_at_owner_repo_and_reinstalls() {
+    fn reset_points_both_runtimes_at_the_remote_url_and_reinstalls() {
         let f = fixture();
         // Claude already has "M" registered → conditional remove must fire.
         let r = RecordingRunner::new()
@@ -1191,19 +1192,47 @@ mod orchestration_tests {
 
         let report = reset(&r, &f.repo, &f.cfg, &crate::output::NoopReporter).unwrap();
 
-        assert_eq!(report.owner_repo, "co/agent-mkt");
+        assert_eq!(report.source, "git@github.com:co/agent-mkt.git");
         assert_eq!(report.plugins, vec!["p1", "p2"]);
         assert_eq!(
             agent_lines(&r.lines()),
             vec![
                 "codex plugin marketplace remove M".to_string(),
-                "codex plugin marketplace add co/agent-mkt".to_string(),
+                "codex plugin marketplace add git@github.com:co/agent-mkt.git".to_string(),
                 "claude plugin marketplace list --json".to_string(),
                 "claude plugin marketplace remove M".to_string(),
-                "claude plugin marketplace add co/agent-mkt".to_string(),
+                "claude plugin marketplace add git@github.com:co/agent-mkt.git".to_string(),
                 "claude plugin install p1@M --scope user".to_string(),
                 "claude plugin install p2@M --scope user".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn reset_accepts_a_nested_gitlab_remote() {
+        // A nested GitLab group/subgroup/repo remote — the >3-path-segment
+        // case the old `owner/repo` slug parser rejected. Passed through whole.
+        let url = "git@gitlab.com:company/team/agent-marketplace.git";
+        let mut f = fixture();
+        f.cfg = Config::new(url, true, true);
+        let r = RecordingRunner::new()
+            .on_arg("git", "--show-toplevel", CommandOutput::ok(f.repo.as_str()))
+            .on(
+                |p, a| p == "claude" && a.contains(&"list"),
+                CommandOutput::ok("[]"),
+            );
+
+        let report = reset(&r, &f.repo, &f.cfg, &crate::output::NoopReporter).unwrap();
+
+        assert_eq!(report.source, url);
+        let lines = agent_lines(&r.lines());
+        assert!(
+            lines.contains(&format!("codex plugin marketplace add {url}")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&format!("claude plugin marketplace add {url}")),
+            "{lines:?}"
         );
     }
 
