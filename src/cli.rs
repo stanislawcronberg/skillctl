@@ -7,7 +7,7 @@
 //! piped result.
 
 use crate::command::{self, RealCommandRunner, TargetSelection};
-use crate::config::{self, Config};
+use crate::config::{self, Config, Runtime};
 use crate::output::{self, StderrReporter};
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
@@ -85,8 +85,8 @@ pub fn run() -> Result<()> {
             codex_only,
         } => {
             let selection = match (claude_only, codex_only) {
-                (true, _) => TargetSelection::ClaudeOnly,
-                (_, true) => TargetSelection::CodexOnly,
+                (true, _) => TargetSelection::Only(Runtime::Claude),
+                (_, true) => TargetSelection::Only(Runtime::Codex),
                 _ => TargetSelection::Auto,
             };
             let cfg_path = skillctl_config_path()?;
@@ -108,15 +108,8 @@ pub fn run() -> Result<()> {
             // trail printed above the spinner stays on screen.
             reporter.finish();
             let report = result?;
-            anstream::eprintln!(
-                "{}",
-                output::sync_summary(
-                    &report,
-                    elapsed,
-                    cfg.targets.claude.enabled,
-                    cfg.targets.codex.enabled
-                )
-            );
+            let managed: Vec<Runtime> = cfg.managed().map(|(r, _)| r).collect();
+            anstream::eprintln!("{}", output::sync_summary(&report, elapsed, &managed));
             if !report.codex_unactivated_plugins.is_empty() {
                 anstream::eprintln!(
                     "{}",
@@ -126,20 +119,17 @@ pub fn run() -> Result<()> {
         }
         Command::Reset => {
             let cfg = load_config()?;
+            let codex_cfg = codex_config_path()?;
             let reporter = make_reporter();
             let start = Instant::now();
-            let result = command::reset(&runner, &cfg, reporter.as_ref());
+            let result = command::reset(&runner, &codex_cfg, &cfg, reporter.as_ref());
             let elapsed = start.elapsed();
             reporter.finish();
             let report = result?;
+            let managed: Vec<Runtime> = cfg.managed().map(|(r, _)| r).collect();
             anstream::eprintln!(
                 "{}",
-                output::reset_summary(
-                    &report.source,
-                    elapsed,
-                    cfg.targets.claude.enabled,
-                    cfg.targets.codex.enabled
-                )
+                output::reset_summary(&report.source, elapsed, &managed)
             );
             if !report.codex_unactivated_plugins.is_empty() {
                 anstream::eprintln!(

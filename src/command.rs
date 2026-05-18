@@ -3,13 +3,19 @@
 //! uses [`RealCommandRunner`]; tests inject a recording fake so the
 //! orchestration logic (ordering, exit-code tolerance, presence checks) is
 //! verifiable without touching real global state.
+//!
+//! Orchestration here is **uniform over the [`Target`] seam**: it iterates the
+//! managed runtimes in split-brain order ([`Config::managed`]) and calls the
+//! trait. It never matches on which runtime it is — that lives in the
+//! adapters (`targets::{claude,codex}`).
 
-use crate::config::{self, Config};
+use crate::config::{Config, Runtime};
 use crate::git;
 use crate::output::{Event, Reporter};
-use crate::targets::{claude, codex, Marketplace};
+use crate::targets::{self, Target, Validated};
 use anyhow::{bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
 pub struct CommandOutput {
@@ -25,7 +31,7 @@ impl CommandOutput {
 }
 
 /// `Send + Sync` so a single `&dyn CommandRunner` can be shared across the
-/// scoped threads that fan out Claude's plugin installs ([`apply_marketplace`]).
+/// scoped threads that fan out Claude's plugin installs.
 pub trait CommandRunner: Send + Sync {
     /// Run `program args...` (optionally in `cwd`) to completion. Returns
     /// `Err` only when the process could not be spawned at all; a non-zero
@@ -59,28 +65,26 @@ impl CommandRunner for RealCommandRunner {
 
 /// Which runtimes `init` should manage. `Auto` (no `--*-only` flag) enables a
 /// runtime only when its CLI is on `PATH` *and* the repo ships its marketplace
-/// file; the `*Only` variants are an explicit hard override that ignores
-/// detection entirely.
+/// file; `Only(r)` is an explicit hard override that ignores detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetSelection {
     Auto,
-    ClaudeOnly,
-    CodexOnly,
+    Only(Runtime),
 }
 
 /// Per-runtime outcome of `init`'s detection, carried to the renderer.
-/// `skip_reason` is `Some` iff the runtime was *not* enabled.
+/// `skip_reason` is `Some` iff the runtime was *not* managed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetOutcome {
-    pub enabled: bool,
+    pub managed: bool,
     pub file_present: bool,
     pub skip_reason: Option<String>,
 }
 
 impl TargetOutcome {
-    fn enabled(file_present: bool) -> Self {
+    fn managed(file_present: bool) -> Self {
         Self {
-            enabled: true,
+            managed: true,
             file_present,
             skip_reason: None,
         }
@@ -88,7 +92,7 @@ impl TargetOutcome {
 
     fn skipped(file_present: bool, why: impl Into<String>) -> Self {
         Self {
-            enabled: false,
+            managed: false,
             file_present,
             skip_reason: Some(why.into()),
         }
@@ -96,13 +100,13 @@ impl TargetOutcome {
 
     /// Auto-detection rule: manage a runtime only when its CLI is on `PATH`
     /// *and* its marketplace file is in the repo.
-    fn detected(on_path: bool, file_present: bool, no_file: impl Into<String>) -> Self {
-        if !on_path {
-            Self::skipped(file_present, "not on PATH")
-        } else if !file_present {
-            Self::skipped(file_present, no_file)
+    fn detected(det: targets::Detection, no_file: impl Into<String>) -> Self {
+        if !det.on_path {
+            Self::skipped(det.file_present, "not on PATH")
+        } else if !det.file_present {
+            Self::skipped(det.file_present, no_file)
         } else {
-            Self::enabled(file_present)
+            Self::managed(det.file_present)
         }
     }
 }
@@ -112,20 +116,16 @@ pub struct InitReport {
     pub repo_root: Utf8PathBuf,
     pub remote: String,
     pub default_branch: String,
-    pub claude: TargetOutcome,
-    pub codex: TargetOutcome,
+    /// Every runtime, in split-brain order — managed and skipped alike (the
+    /// renderer shows the skipped ones' reasons).
+    pub outcomes: BTreeMap<Runtime, TargetOutcome>,
     pub config_path: Utf8PathBuf,
 }
 
-/// Is `program` usable here? Routed through the [`CommandRunner`] seam (not a
-/// `which` crate) so detection is unit-testable with the same fake the
-/// orchestration tests use. A non-spawnable binary surfaces as `Err` from the
-/// real runner; both that and a non-zero `--version` mean "not on PATH".
-fn on_path(runner: &dyn CommandRunner, program: &str) -> bool {
-    runner
-        .run(program, &["--version"], None)
-        .map(|o| o.success())
-        .unwrap_or(false)
+impl InitReport {
+    pub fn outcome(&self, r: Runtime) -> &TargetOutcome {
+        &self.outcomes[&r]
+    }
 }
 
 /// `skillctl init`: detect the repo, refuse to clobber an existing config
@@ -150,33 +150,25 @@ pub fn init(
     let remote = git::origin_url(runner, &repo_root)?;
     let default_branch = git::default_branch(runner, &repo_root);
 
-    let claude_file = repo_root.join(config::CLAUDE_MARKETPLACE_FILE).exists();
-    let codex_file = repo_root.join(config::CODEX_MARKETPLACE_FILE).exists();
-
-    let (claude, codex) = match selection {
-        TargetSelection::Auto => (
-            TargetOutcome::detected(
-                on_path(runner, "claude"),
-                claude_file,
-                format!("no {}", config::CLAUDE_MARKETPLACE_FILE),
+    // Uniform over `Runtime::ALL` — `init` never names a concrete runtime; the
+    // per-runtime facts come from `Runtime`/the detection probe.
+    let mut outcomes = BTreeMap::new();
+    for rt in Runtime::ALL {
+        let det = targets::detect(runner, &repo_root, rt);
+        let outcome = match selection {
+            TargetSelection::Auto => {
+                TargetOutcome::detected(det, format!("no {}", rt.default_marketplace_file()))
+            }
+            TargetSelection::Only(only) if rt == only => TargetOutcome::managed(det.file_present),
+            TargetSelection::Only(only) => TargetOutcome::skipped(
+                det.file_present,
+                format!("excluded by --{}-only", only.key()),
             ),
-            TargetOutcome::detected(
-                on_path(runner, "codex"),
-                codex_file,
-                format!("no {}", config::CODEX_MARKETPLACE_FILE),
-            ),
-        ),
-        TargetSelection::ClaudeOnly => (
-            TargetOutcome::enabled(claude_file),
-            TargetOutcome::skipped(codex_file, "excluded by --claude-only"),
-        ),
-        TargetSelection::CodexOnly => (
-            TargetOutcome::skipped(claude_file, "excluded by --codex-only"),
-            TargetOutcome::enabled(codex_file),
-        ),
-    };
+        };
+        outcomes.insert(rt, outcome);
+    }
 
-    if !claude.enabled && !codex.enabled {
+    if outcomes.values().all(|o| !o.managed) {
         bail!(
             "no runtimes to manage here: neither `claude` nor `codex` is on \
              PATH with its marketplace file in this repo.\n  \
@@ -185,347 +177,72 @@ pub fn init(
         );
     }
 
-    Config::new(remote.clone(), claude.enabled, codex.enabled).save(config_path)?;
+    let managed: Vec<Runtime> = outcomes
+        .iter()
+        .filter(|(_, o)| o.managed)
+        .map(|(r, _)| *r)
+        .collect();
+    Config::new(remote.clone(), managed).save(config_path)?;
 
     Ok(InitReport {
         repo_root,
         remote,
         default_branch,
-        claude,
-        codex,
+        outcomes,
         config_path: config_path.to_path_buf(),
     })
 }
 
-/// `sync`/`reset` are no-ops with both targets off; fail loudly instead of
+/// `sync`/`reset` are no-ops with nothing managed; fail loudly instead of
 /// silently doing nothing.
 fn ensure_any_target(cfg: &Config) -> Result<()> {
-    if !cfg.targets.claude.enabled && !cfg.targets.codex.enabled {
+    if cfg.targets.is_empty() {
         bail!(
-            "no targets enabled in config — re-run `skillctl init` \
+            "no runtimes managed in config — re-run `skillctl init` \
              (optionally with --claude-only / --codex-only)"
         );
     }
     Ok(())
 }
 
+/// Build the managed targets, already in split-brain order ([`Config::managed`]
+/// is `Runtime`-ordered, Codex before Claude).
+fn managed_targets<'a>(
+    cfg: &Config,
+    runner: &'a dyn CommandRunner,
+    codex_config: &Utf8Path,
+) -> Vec<Box<dyn Target + 'a>> {
+    cfg.managed()
+        .map(|(r, t)| targets::make(r, t, runner, codex_config))
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncReport {
     pub repo_root: Utf8PathBuf,
-    pub claude_name: Option<String>,
-    pub codex_name: Option<String>,
+    /// Marketplace name each managed runtime was pointed at.
+    pub names: BTreeMap<Runtime, String>,
+    /// Plugins skillctl (re)installed — Claude's set; empty for a Codex-only
+    /// sync (Codex has no per-plugin install).
     pub plugins: Vec<String>,
-    /// Codex plugins that registered but won't auto-install because their
-    /// `policy.installation` is not `INSTALLED_BY_DEFAULT` — surfaced as a
-    /// post-sync advisory (skillctl cannot install Codex plugins itself).
+    /// Codex plugins that registered but won't auto-install (advisory; sync
+    /// still succeeds). Empty when Codex is unmanaged.
     pub codex_unactivated_plugins: Vec<String>,
 }
 
-/// Read and structurally parse one marketplace file under `repo_root`,
-/// returning the parsed `Marketplace` plus the raw JSON (Codex needs the raw
-/// text for its shallow policy check).
-fn read_market(repo_root: &Utf8Path, rel: &Utf8Path) -> Result<(Marketplace, String)> {
-    let path = repo_root.join(rel);
-    let raw = std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
-    let mkt = Marketplace::parse(&raw).with_context(|| format!("in {path}"))?;
-    Ok((mkt, raw))
-}
-
-/// What `reset` needs from the marketplace source: the two parsed
-/// marketplaces (each `Some` only when that target is enabled) plus the
-/// Codex plugins that won't auto-install (see [`codex::installation_advisory`]).
-#[derive(Debug)]
-struct LoadedMarketplaces {
-    claude: Option<Marketplace>,
-    codex: Option<Marketplace>,
-    codex_unactivated: Vec<String>,
-}
-
-/// Source of the parsed marketplace files `reset` applies. Production
-/// shallow-clones the configured remote's default branch; tests stub it so
-/// the clone + filesystem step never needs real git or a network.
-trait MarketplacePair {
-    fn load(&self, cfg: &Config) -> Result<LoadedMarketplaces>;
-}
-
-/// Production [`MarketplacePair`]: `git clone --depth 1 -- <remote> <tmp>`
-/// (no `--branch` ⇒ the remote's default branch; host-agnostic for GitHub,
-/// GitLab incl. nested groups, Bitbucket, self-hosted; ssh or https), then
-/// read both marketplace files out of the checkout. The `TempDir` is removed
-/// on drop, *after* the reads.
-struct RemoteClone<'a> {
-    runner: &'a dyn CommandRunner,
-    remote: &'a str,
-}
-
-impl RemoteClone<'_> {
-    /// Clone into `checkout`, then read both marketplace files from it. Split
-    /// from [`MarketplacePair::load`] so a test can drive this read path
-    /// against a pre-populated dir with a scripted-success fake `git clone`.
-    fn load_from(&self, cfg: &Config, checkout: &Utf8Path) -> Result<LoadedMarketplaces> {
-        let out = self.runner.run(
-            "git",
-            &[
-                "clone",
-                "--depth",
-                "1",
-                "--",
-                self.remote,
-                checkout.as_str(),
-            ],
-            None,
-        )?;
-        if !out.success() {
-            bail!(
-                "git clone of the configured remote failed (could not fetch {}): {}",
-                self.remote,
-                out.stderr.trim()
-            );
-        }
-        let claude = cfg
-            .targets
-            .claude
-            .enabled
-            .then(|| read_market(checkout, &cfg.targets.claude.marketplace_file))
-            .transpose()?
-            .map(|(m, _)| m);
-        let (codex, codex_unactivated) = if cfg.targets.codex.enabled {
-            let (m, raw) = read_market(checkout, &cfg.targets.codex.marketplace_file)?;
-            let unactivated = codex::installation_advisory(&raw)?;
-            (Some(m), unactivated)
-        } else {
-            (None, Vec::new())
-        };
-        Ok(LoadedMarketplaces {
-            claude,
-            codex,
-            codex_unactivated,
-        })
+impl SyncReport {
+    /// The marketplace name a runtime was pointed at. Test-only ergonomics —
+    /// the renderer reads `plugins`/`codex_unactivated_plugins`, not this.
+    #[cfg(test)]
+    pub fn name(&self, r: Runtime) -> Option<&str> {
+        self.names.get(&r).map(String::as_str)
     }
 }
 
-impl MarketplacePair for RemoteClone<'_> {
-    fn load(&self, cfg: &Config) -> Result<LoadedMarketplaces> {
-        let tmp = tempfile::Builder::new()
-            .prefix("skillctl-reset-")
-            .tempdir()
-            .context("creating a temp dir for the shallow clone")?;
-        let checkout =
-            Utf8Path::from_path(tmp.path()).context("temp dir path is not valid UTF-8")?;
-        let loaded = self.load_from(cfg, checkout)?;
-        drop(tmp); // remove the clone now that both files are read
-        Ok(loaded)
-    }
-}
-
-/// Everything pre-flight parsed/validated, shared by `sync` and `reset`.
-struct Preflight {
-    repo_root: Utf8PathBuf,
-    claude_mkt: Option<Marketplace>,
-    codex_mkt: Option<Marketplace>,
-    /// Codex plugins that will register but not auto-install (not
-    /// `INSTALLED_BY_DEFAULT`). Empty when Codex is disabled.
-    codex_unactivated: Vec<String>,
-}
-
-/// Detect the repo, prove `origin` matches the configured remote, parse both
-/// marketplace files, run Claude's authoritative validator, and apply Codex's
-/// known shallow rule — all before any state is touched. `check_remote` is
-/// skipped by `reset` (it deliberately points away from this worktree).
-fn preflight(
-    runner: &dyn CommandRunner,
-    cwd: &Utf8Path,
-    cfg: &Config,
-    check_remote: bool,
-) -> Result<Preflight> {
-    let repo_root = git::repo_root(runner, cwd)?;
-
-    if check_remote {
-        let origin = git::origin_url(runner, &repo_root)?;
-        let want = git::canonical_remote_key(&cfg.repo.remote);
-        let got = git::canonical_remote_key(&origin);
-        if want.is_none() || got.is_none() || want != got {
-            bail!(
-                "origin remote does not match configured remote — refusing to sync.\n  \
-                 configured: {}\n  origin:     {origin}",
-                cfg.repo.remote
-            );
-        }
-    }
-
-    let claude_mkt = if cfg.targets.claude.enabled {
-        let (mkt, _) = read_market(&repo_root, &cfg.targets.claude.marketplace_file)?;
-        let out = runner.run("claude", &["plugin", "validate", repo_root.as_str()], None)?;
-        if !out.success() {
-            let detail = if out.stdout.trim().is_empty() {
-                out.stderr.trim()
-            } else {
-                out.stdout.trim()
-            };
-            bail!("`claude plugin validate` rejected the marketplace:\n{detail}");
-        }
-        Some(mkt)
-    } else {
-        None
-    };
-
-    let mut codex_unactivated = Vec::new();
-    let codex_mkt = if cfg.targets.codex.enabled {
-        let (mkt, raw) = read_market(&repo_root, &cfg.targets.codex.marketplace_file)?;
-        codex::validate_marketplace_json(&raw)
-            .with_context(|| format!("in {}", cfg.targets.codex.marketplace_file))?;
-        codex_unactivated = codex::installation_advisory(&raw)
-            .with_context(|| format!("in {}", cfg.targets.codex.marketplace_file))?;
-        Some(mkt)
-    } else {
-        None
-    };
-
-    Ok(Preflight {
-        repo_root,
-        claude_mkt,
-        codex_mkt,
-        codex_unactivated,
-    })
-}
-
-struct Applied {
-    codex_name: Option<String>,
-    claude_name: Option<String>,
-    plugins: Vec<String>,
-}
-
-/// Point both runtimes' marketplace at `source` (a worktree path for `sync`,
-/// an `owner/repo` for `reset`) and reinstall every Claude plugin. Codex is
-/// mutated first so an unanticipated Codex rejection aborts before Claude is
-/// touched — there is no rollback, so this ordering is what prevents a
-/// split brain. Codex's `remove` is unconditional (a different source under
-/// the same name is otherwise refused) and its exit 1 when absent is
-/// tolerated; Claude's `remove` is non-idempotent so it is gated on a
-/// presence check, and Claude's `remove` orphans installed plugins so every
-/// plugin is (re)installed afterwards.
-fn apply_marketplace(
-    runner: &dyn CommandRunner,
-    source: &str,
-    claude_mkt: Option<&Marketplace>,
-    codex_mkt: Option<&Marketplace>,
-    scope: &str,
-    reporter: &dyn Reporter,
-) -> Result<Applied> {
-    let codex_name = if let Some(m) = codex_mkt {
-        let _ = runner.run("codex", &["plugin", "marketplace", "remove", &m.name], None)?; // exit 1 (absent) tolerated
-        let add = runner.run("codex", &["plugin", "marketplace", "add", source], None)?;
-        if !add.success() {
-            bail!(
-                "`codex plugin marketplace add` failed: {}",
-                add.stderr.trim()
-            );
-        }
-        reporter.event(Event::Marketplace {
-            runtime: "Codex",
-            name: &m.name,
-        });
-        Some(m.name.clone())
-    } else {
-        None
-    };
-
-    let mut plugins = Vec::new();
-    let claude_name = if let Some(m) = claude_mkt {
-        if claude_marketplace_present(runner, &m.name)? {
-            let rm = runner.run(
-                "claude",
-                &["plugin", "marketplace", "remove", &m.name],
-                None,
-            )?;
-            if !rm.success() {
-                bail!(
-                    "`claude plugin marketplace remove {}` failed: {}",
-                    m.name,
-                    rm.stderr.trim()
-                );
-            }
-        }
-        let add = runner.run("claude", &["plugin", "marketplace", "add", source], None)?;
-        if !add.success() {
-            bail!(
-                "`claude plugin marketplace add` failed: {}",
-                add.stderr.trim()
-            );
-        }
-        reporter.event(Event::Marketplace {
-            runtime: "Claude",
-            name: &m.name,
-        });
-
-        // Each `claude plugin install` is independent and purely additive, so
-        // fan them out across a bounded pool of scoped threads rather than
-        // paying the CLI cold-start serially. A shared atomic cursor caps
-        // in-flight installs at `MAX_INSTALL_CONCURRENCY` regardless of plugin
-        // count; this is the *only* parallel region — Codex and Claude's
-        // marketplace mutations stay sequential, so the Codex-before-Claude
-        // split-brain ordering is untouched. Every failure is collected (not
-        // bailed on the first) so one bad plugin can't mask the rest, and the
-        // aggregate is sorted so the error message is deterministic.
-        const MAX_INSTALL_CONCURRENCY: usize = 4;
-        let workers = m.plugins.len().clamp(1, MAX_INSTALL_CONCURRENCY);
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let failures: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
-
-        std::thread::scope(|s| {
-            for _ in 0..workers {
-                s.spawn(|| loop {
-                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(p) = m.plugins.get(i) else { break };
-                    let spec = format!("{p}@{}", m.name);
-                    match runner.run(
-                        "claude",
-                        &["plugin", "install", &spec, "--scope", scope],
-                        None,
-                    ) {
-                        Ok(out) if out.success() => {
-                            reporter.event(Event::Plugin { name: p });
-                        }
-                        Ok(out) => failures
-                            .lock()
-                            .unwrap()
-                            .push((spec, out.stderr.trim().to_string())),
-                        Err(e) => failures.lock().unwrap().push((spec, e.to_string())),
-                    }
-                });
-            }
-        });
-
-        let mut failures = failures.into_inner().unwrap();
-        if !failures.is_empty() {
-            failures.sort();
-            let detail = failures
-                .iter()
-                .map(|(spec, err)| format!("  {spec}: {err}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            bail!(
-                "{} plugin install{} failed:\n{detail}",
-                failures.len(),
-                if failures.len() == 1 { "" } else { "s" }
-            );
-        }
-        plugins = m.plugins.clone();
-        Some(m.name.clone())
-    } else {
-        None
-    };
-
-    Ok(Applied {
-        codex_name,
-        claude_name,
-        plugins,
-    })
-}
-
-/// `skillctl sync`: point Codex then Claude at this worktree and install every
-/// plugin. All validation happens before any mutation; Codex is mutated before
-/// Claude so an unanticipated Codex rejection can never leave a split brain.
+/// `skillctl sync`: point each managed runtime at this worktree and install
+/// every plugin. All validation happens before any mutation; runtimes are
+/// mutated in split-brain order so an unanticipated rejection can never leave
+/// a split brain.
 pub fn sync(
     runner: &dyn CommandRunner,
     cwd: &Utf8Path,
@@ -534,13 +251,31 @@ pub fn sync(
     reporter: &dyn Reporter,
 ) -> Result<SyncReport> {
     ensure_any_target(cfg)?;
-    let pre = preflight(runner, cwd, cfg, true)?;
-    let repo_root = pre.repo_root;
-    let codex_unactivated = pre.codex_unactivated;
-    let src = repo_root.as_str();
+    let repo_root = git::repo_root(runner, cwd)?;
 
-    // Announce the target *now* — after validation, before the first
-    // mutation — so the worktree is on screen even if a later step fails.
+    // Prove `origin` matches the configured remote before anything else.
+    let origin = git::origin_url(runner, &repo_root)?;
+    let want = git::canonical_remote_key(&cfg.repo.remote);
+    let got = git::canonical_remote_key(&origin);
+    if want.is_none() || got.is_none() || want != got {
+        bail!(
+            "origin remote does not match configured remote — refusing to sync.\n  \
+             configured: {}\n  origin:     {origin}",
+            cfg.repo.remote
+        );
+    }
+
+    let targets = managed_targets(cfg, runner, codex_config);
+
+    // Pre-flight: authoritative validation of every managed runtime, before
+    // any mutation. A failure here changes nothing.
+    let mut validated: BTreeMap<Runtime, Validated> = BTreeMap::new();
+    for t in &targets {
+        validated.insert(t.runtime(), t.validate(&repo_root)?);
+    }
+
+    // Announce the target now — after validation, before the first mutation —
+    // so the worktree is on screen even if a later step fails.
     let st = git::work_state(runner, &repo_root)?;
     let target = git::owner_repo(&cfg.repo.remote).unwrap_or_else(|| cfg.repo.remote.clone());
     reporter.event(Event::Target {
@@ -552,140 +287,186 @@ pub fn sync(
         dirty: st.dirty,
     });
 
-    let Applied {
-        codex_name,
-        claude_name,
-        plugins,
-    } = apply_marketplace(
-        runner,
-        src,
-        pre.claude_mkt.as_ref(),
-        pre.codex_mkt.as_ref(),
-        cfg.targets.claude.scope.as_str(),
-        reporter,
-    )?;
-
-    // ---- Post-sync assertion (loud): both runtimes must now resolve the
-    // marketplace name to *this* worktree, else the name-identity contract
-    // skillctl relies on is broken. ----
-    if let Some(name) = &claude_name {
-        let entries = claude_list(runner)?;
-        let entry = entries.iter().find(|e| &e.name == name).with_context(|| {
-            format!(
-                "name-identity contract broken (Claude): marketplace \
-                 \"{name}\" is not registered after sync"
-            )
-        })?;
-        let got = claude::entry_source(entry).unwrap_or_default();
-        if !same_path(&got, src) {
-            bail!(
-                "name-identity contract broken (Claude): \"{name}\" points \
-                 at {got}, expected {repo_root}"
-            );
-        }
+    // Mutate, in split-brain order.
+    let mut plugins = Vec::new();
+    for t in &targets {
+        let mkt = &validated[&t.runtime()].marketplace;
+        plugins.extend(t.apply(repo_root.as_str(), mkt, reporter)?);
     }
-    if let Some(name) = &codex_name {
-        let entry = codex::read_marketplace(codex_config, name)?.with_context(|| {
+
+    // Post-sync assertion (loud): every runtime must now resolve the
+    // marketplace name to *this* worktree, else the name-identity contract
+    // skillctl relies on is broken.
+    for t in &targets {
+        let name = &validated[&t.runtime()].marketplace.name;
+        let got = t.pointed_at(name)?.with_context(|| {
             format!(
-                "name-identity contract broken (Codex): marketplace \
-                     \"{name}\" is not registered after sync"
+                "name-identity contract broken ({}): marketplace \
+                 \"{name}\" is not registered after sync",
+                t.runtime().label()
             )
         })?;
-        if !same_path(&entry.source, src) {
+        if !same_path(&got, repo_root.as_str()) {
             bail!(
-                "name-identity contract broken (Codex): \"{name}\" points \
-                 at {}, expected {repo_root}",
-                entry.source
+                "name-identity contract broken ({}): \"{name}\" points \
+                 at {got}, expected {repo_root}",
+                t.runtime().label()
             );
         }
     }
 
     Ok(SyncReport {
         repo_root,
-        claude_name,
-        codex_name,
+        names: names_of(&validated),
         plugins,
-        codex_unactivated_plugins: codex_unactivated,
+        codex_unactivated_plugins: advisories_of(&validated),
     })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResetReport {
     pub source: String,
-    pub claude_name: Option<String>,
-    pub codex_name: Option<String>,
     pub plugins: Vec<String>,
-    /// Codex plugins that registered but won't auto-install because their
-    /// `policy.installation` is not `INSTALLED_BY_DEFAULT` — surfaced as a
-    /// post-reset advisory (skillctl cannot install Codex plugins itself).
     pub codex_unactivated_plugins: Vec<String>,
 }
 
-/// `skillctl reset`: snap both runtimes back to the configured marketplace's
-/// default branch. It shallow-clones the configured remote (it never reads
-/// the local worktree), so it works from *any* directory and can never
-/// reinstall an uncommitted local plugin set — the plugin list always
-/// matches what the runtimes resolve when pointed at the remote URL.
-/// Codex-first, like `sync`. Claude's `marketplace remove` orphans its
-/// installed plugins, so every plugin is reinstalled afterwards. A recovery
-/// command: no `origin` check, no validators, no git worktree required.
+/// Marketplace name per runtime, from the pre-flight results.
+fn names_of(v: &BTreeMap<Runtime, Validated>) -> BTreeMap<Runtime, String> {
+    v.iter()
+        .map(|(r, val)| (*r, val.marketplace.name.clone()))
+        .collect()
+}
+
+/// All post-mutation advisories (only Codex produces any). Aggregated without
+/// naming a runtime — orchestration stays uniform over the seam.
+fn advisories_of(v: &BTreeMap<Runtime, Validated>) -> Vec<String> {
+    v.values().flat_map(|val| val.advisories.clone()).collect()
+}
+
+/// Source of the default-branch checkout `reset` reads. Production
+/// shallow-clones the configured remote into a temp dir (removed after the
+/// per-target reads); tests stub it so the clone + filesystem step never
+/// needs real git or a network.
+trait CheckoutSource {
+    /// Run `read` with a directory holding the remote's default-branch
+    /// checkout, returning whatever it produced.
+    fn with_checkout(
+        &self,
+        read: &mut dyn FnMut(&Utf8Path) -> Result<BTreeMap<Runtime, Validated>>,
+    ) -> Result<BTreeMap<Runtime, Validated>>;
+}
+
+/// Production [`CheckoutSource`]: `git clone --depth 1 -- <remote> <tmp>` (no
+/// `--branch` ⇒ the remote's default branch; host-agnostic; ssh or https),
+/// then read every target's marketplace out of the checkout. The `TempDir` is
+/// removed on drop, *after* the reads.
+struct RemoteClone<'a> {
+    runner: &'a dyn CommandRunner,
+    remote: &'a str,
+}
+
+impl RemoteClone<'_> {
+    /// `git clone` into `dir`, then run `read` against it. Split from
+    /// [`CheckoutSource::with_checkout`] so a test can drive this read path
+    /// against a pre-populated dir with a scripted-success fake `git clone`.
+    fn clone_then<T>(
+        &self,
+        dir: &Utf8Path,
+        read: impl FnOnce(&Utf8Path) -> Result<T>,
+    ) -> Result<T> {
+        let out = self.runner.run(
+            "git",
+            &["clone", "--depth", "1", "--", self.remote, dir.as_str()],
+            None,
+        )?;
+        if !out.success() {
+            bail!(
+                "git clone of the configured remote failed (could not fetch {}): {}",
+                self.remote,
+                out.stderr.trim()
+            );
+        }
+        read(dir)
+    }
+}
+
+impl CheckoutSource for RemoteClone<'_> {
+    fn with_checkout(
+        &self,
+        read: &mut dyn FnMut(&Utf8Path) -> Result<BTreeMap<Runtime, Validated>>,
+    ) -> Result<BTreeMap<Runtime, Validated>> {
+        let tmp = tempfile::Builder::new()
+            .prefix("skillctl-reset-")
+            .tempdir()
+            .context("creating a temp dir for the shallow clone")?;
+        let dir = Utf8Path::from_path(tmp.path()).context("temp dir path is not valid UTF-8")?;
+        let loaded = self.clone_then(dir, |d| read(d));
+        drop(tmp); // remove the clone now that every file is read
+        loaded
+    }
+}
+
+/// `skillctl reset`: snap every managed runtime back to the configured
+/// marketplace's default branch. It shallow-clones the configured remote (it
+/// never reads the local worktree), so it works from *any* directory and can
+/// never reinstall an uncommitted local plugin set. Split-brain order, like
+/// `sync`. A recovery command: no `origin` check, **no authoritative
+/// validators** (it only structurally reads + the Codex advisory), no git
+/// worktree required.
 pub fn reset(
     runner: &dyn CommandRunner,
+    codex_config: &Utf8Path,
     cfg: &Config,
     reporter: &dyn Reporter,
 ) -> Result<ResetReport> {
-    let pair = RemoteClone {
+    let src = RemoteClone {
         runner,
         remote: &cfg.repo.remote,
     };
-    reset_with(runner, cfg, &pair, reporter)
+    reset_with(runner, codex_config, cfg, &src, reporter)
 }
 
-/// `reset` with the marketplace source injected, so tests exercise the
-/// orchestration without real git or a network (see `StubPair`).
+/// `reset` with the checkout source injected, so tests exercise the
+/// orchestration without real git or a network (see `StubCheckout`).
 fn reset_with(
     runner: &dyn CommandRunner,
+    codex_config: &Utf8Path,
     cfg: &Config,
-    source_pair: &dyn MarketplacePair,
+    source: &dyn CheckoutSource,
     reporter: &dyn Reporter,
 ) -> Result<ResetReport> {
     ensure_any_target(cfg)?;
     // Validate the remote shape up-front (single source of the bad-remote
     // message) — before any temp dir or `git clone` is attempted.
-    let source = git::marketplace_source(&cfg.repo.remote).with_context(|| {
+    let url = git::marketplace_source(&cfg.repo.remote).with_context(|| {
         format!(
             "configured remote is not a recognizable git remote: {}",
             cfg.repo.remote
         )
     })?;
 
-    let LoadedMarketplaces {
-        claude: claude_mkt,
-        codex: codex_mkt,
-        codex_unactivated,
-    } = source_pair.load(cfg)?;
+    let targets = managed_targets(cfg, runner, codex_config);
 
-    reporter.event(Event::ResetTarget { source: &source });
+    let validated = source.with_checkout(&mut |dir| {
+        let mut m = BTreeMap::new();
+        for t in &targets {
+            m.insert(t.runtime(), t.read(dir)?);
+        }
+        Ok(m)
+    })?;
 
-    let Applied {
-        codex_name,
-        claude_name,
-        plugins,
-    } = apply_marketplace(
-        runner,
-        &source,
-        claude_mkt.as_ref(),
-        codex_mkt.as_ref(),
-        cfg.targets.claude.scope.as_str(),
-        reporter,
-    )?;
+    reporter.event(Event::ResetTarget { source: &url });
+
+    let mut plugins = Vec::new();
+    for t in &targets {
+        let mkt = &validated[&t.runtime()].marketplace;
+        plugins.extend(t.apply(&url, mkt, reporter)?);
+    }
 
     Ok(ResetReport {
-        source,
-        claude_name,
-        codex_name,
+        source: url,
         plugins,
-        codex_unactivated_plugins: codex_unactivated,
+        codex_unactivated_plugins: advisories_of(&validated),
     })
 }
 
@@ -698,19 +479,37 @@ pub struct RepoSnapshot {
     pub default_branch: String,
 }
 
+/// Where one runtime stands: the marketplace name skillctl associates with it
+/// and where that name currently resolves. Both best-effort (`None`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetStatus {
+    pub name: Option<String>,
+    pub pointed_at: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusReport {
     pub configured_remote: String,
     /// `None` ⇒ not inside a git repo; worktree/origin/match rows are skipped.
     pub snapshot: Option<RepoSnapshot>,
-    /// Whether config manages each runtime — drives the `(not managed)` row.
-    pub claude_enabled: bool,
-    pub codex_enabled: bool,
-    pub claude_name: Option<String>,
-    pub codex_name: Option<String>,
-    /// Where each runtime currently resolves its marketplace name, if known.
-    pub claude_pointed_at: Option<String>,
-    pub codex_pointed_at: Option<String>,
+    /// Managed runtimes only (mirrors `Config`); an absent runtime renders as
+    /// `(not managed)`.
+    pub targets: BTreeMap<Runtime, TargetStatus>,
+}
+
+impl StatusReport {
+    pub fn target(&self, r: Runtime) -> Option<&TargetStatus> {
+        self.targets.get(&r)
+    }
+    /// Test-only ergonomics; the renderer goes through [`target`](Self::target).
+    #[cfg(test)]
+    pub fn name(&self, r: Runtime) -> Option<&str> {
+        self.targets.get(&r).and_then(|t| t.name.as_deref())
+    }
+    #[cfg(test)]
+    pub fn pointed_at(&self, r: Runtime) -> Option<&str> {
+        self.targets.get(&r).and_then(|t| t.pointed_at.as_deref())
+    }
 }
 
 /// `skillctl status`: a fully live snapshot (no state file). Best-effort —
@@ -726,8 +525,7 @@ pub fn status(
     cfg: &Config,
 ) -> Result<StatusReport> {
     // Being outside a git repo is not an error here — degrade to `None`. An
-    // in-repo `git::state` failure (e.g. no `origin`) still propagates,
-    // preserving today's in-repo behavior.
+    // in-repo `git::state` failure (e.g. no `origin`) still propagates.
     let snapshot = match git::repo_root(runner, cwd) {
         Ok(repo_root) => {
             let repo = git::state(runner, &repo_root)?;
@@ -746,112 +544,25 @@ pub fn status(
         Err(_) => None,
     };
 
-    let (claude_name, codex_name) = resolve_names(runner, codex_config, cfg, snapshot.as_ref());
-
-    let claude_pointed_at = claude_name.as_ref().and_then(|name| {
-        claude_list(runner)
-            .ok()?
-            .iter()
-            .find(|e| &e.name == name)
-            .and_then(claude::entry_source)
-    });
-    let codex_pointed_at = codex_name.as_ref().and_then(|name| {
-        codex::read_marketplace(codex_config, name)
-            .ok()
-            .flatten()
-            .map(|e| e.source)
-    });
+    let targets = managed_targets(cfg, runner, codex_config);
+    let mut tmap = BTreeMap::new();
+    for t in &targets {
+        // In a repo: the name from the worktree's marketplace file. Outside a
+        // repo there is no file, so match a *registered* marketplace whose
+        // source resolves to the configured remote.
+        let name = match &snapshot {
+            Some(snap) => t.marketplace_name(&snap.repo.root),
+            None => t.registered_name_for(&cfg.repo.remote).ok().flatten(),
+        };
+        let pointed_at = name.as_ref().and_then(|n| t.pointed_at(n).ok().flatten());
+        tmap.insert(t.runtime(), TargetStatus { name, pointed_at });
+    }
 
     Ok(StatusReport {
         configured_remote: cfg.repo.remote.clone(),
         snapshot,
-        claude_enabled: cfg.targets.claude.enabled,
-        codex_enabled: cfg.targets.codex.enabled,
-        claude_name,
-        codex_name,
-        claude_pointed_at,
-        codex_pointed_at,
+        targets: tmap,
     })
-}
-
-/// Resolve each runtime's marketplace name. In a repo: from the worktree's
-/// marketplace files (unchanged — keeps in-repo output byte-identical).
-/// Outside a repo there is no file, so match a *registered* marketplace
-/// whose source resolves to the configured remote and take its name.
-/// Best-effort: an unmatched runtime degrades to `None`.
-fn resolve_names(
-    runner: &dyn CommandRunner,
-    codex_config: &Utf8Path,
-    cfg: &Config,
-    snapshot: Option<&RepoSnapshot>,
-) -> (Option<String>, Option<String>) {
-    if let Some(snap) = snapshot {
-        let name_of = |rel: &Utf8Path| read_market(&snap.repo.root, rel).ok().map(|(m, _)| m.name);
-        let claude = cfg
-            .targets
-            .claude
-            .enabled
-            .then(|| name_of(&cfg.targets.claude.marketplace_file))
-            .flatten();
-        let codex = cfg
-            .targets
-            .codex
-            .enabled
-            .then(|| name_of(&cfg.targets.codex.marketplace_file))
-            .flatten();
-        return (claude, codex);
-    }
-
-    let want = git::canonical_remote_key(&cfg.repo.remote);
-    let claude = cfg
-        .targets
-        .claude
-        .enabled
-        .then(|| {
-            want.as_ref()?;
-            claude_list(runner).ok()?.into_iter().find_map(|e| {
-                let src = claude::entry_source(&e)?;
-                let key = git::canonical_remote_key(&src).or_else(|| github_owner_repo_key(&src));
-                (key == want).then_some(e.name)
-            })
-        })
-        .flatten();
-    let codex = cfg
-        .targets
-        .codex
-        .enabled
-        .then(|| {
-            codex::find_marketplace_by_source(codex_config, &cfg.repo.remote)
-                .ok()
-                .flatten()
-        })
-        .flatten();
-    (claude, codex)
-}
-
-fn claude_list(runner: &dyn CommandRunner) -> Result<Vec<claude::ClaudeEntry>> {
-    let out = runner.run("claude", &["plugin", "marketplace", "list", "--json"], None)?;
-    if !out.success() {
-        bail!(
-            "`claude plugin marketplace list --json` failed: {}",
-            out.stderr.trim()
-        );
-    }
-    claude::parse_marketplace_list(&out.stdout)
-}
-
-fn claude_marketplace_present(runner: &dyn CommandRunner, name: &str) -> Result<bool> {
-    Ok(claude_list(runner)?.iter().any(|e| e.name == name))
-}
-
-/// Best-effort canonical key for a Claude github entry whose source is a bare
-/// `owner/repo` (Claude resolves those against github.com).
-/// [`git::canonical_remote_key`] needs a host and returns `None` for a bare
-/// slug — this fills that gap, used only by the outside-a-repo `status` match.
-fn github_owner_repo_key(s: &str) -> Option<String> {
-    let s = s.trim().trim_end_matches('/');
-    (s.matches('/').count() == 1 && !s.contains(':'))
-        .then(|| format!("github.com/{}", s.to_lowercase()))
 }
 
 /// The canonical "do these two paths point at the same worktree" rule,
@@ -1051,7 +762,10 @@ mod orchestration_tests {
         std::fs::write(repo.join(".claude-plugin/marketplace.json"), CLAUDE_MKT).unwrap();
         std::fs::write(repo.join(".agents/plugins/marketplace.json"), CODEX_MKT).unwrap();
         let codex_cfg = repo.join("codex-config.toml");
-        let cfg = Config::new("git@github.com:co/agent-mkt.git", true, true);
+        let cfg = Config::new(
+            "git@github.com:co/agent-mkt.git",
+            [Runtime::Codex, Runtime::Claude],
+        );
         Fix {
             _dir: dir,
             repo,
@@ -1197,11 +911,11 @@ mod orchestration_tests {
             .collect()
     }
 
-    // The Claude plugin-install loop now fans out across scoped threads, so the
+    // The Claude plugin-install loop fans out across scoped threads, so the
     // *relative order of the install calls is nondeterministic*. These helpers
-    // let the order-sensitive tests pin everything that is still deterministic
-    // (the split-brain backbone, presence gating, the post-assert `list`) while
-    // asserting the installs by set membership plus a bracket invariant.
+    // pin everything that is still deterministic (the split-brain backbone,
+    // presence gating, the post-assert `list`) while asserting the installs by
+    // set membership plus a bracket invariant.
 
     /// Agent calls with `plugin install` removed — order is still fully
     /// deterministic and pins the Codex-before-Claude ordering.
@@ -1213,9 +927,6 @@ mod orchestration_tests {
     }
 
     /// The set of `plugin install` calls (sequence is nondeterministic).
-    /// Set membership alone can't catch a *duplicate* install, so pair it
-    /// with [`install_count`] — a cursor off-by-one that double-claims an
-    /// index would slip past `installs` but not the count.
     fn installs(lines: &[String]) -> HashSet<String> {
         agent_lines(lines)
             .into_iter()
@@ -1281,7 +992,8 @@ mod orchestration_tests {
 
         let repo = f.repo.as_str();
         let lines = r.lines();
-        // Deterministic backbone: Codex fully before Claude (split-brain
+        // Deterministic backbone: Claude's authoritative validator (pre-flight,
+        // Codex's is silent), then Codex fully before Claude (split-brain
         // ordering), presence gating, and the trailing post-assert `list`.
         assert_eq!(
             backbone(&lines),
@@ -1295,8 +1007,6 @@ mod orchestration_tests {
                 "claude plugin marketplace list --json".to_string(),
             ]
         );
-        // Both installs happened, each exactly once (order nondeterministic
-        // across the fan-out; the count guards against a cursor double-claim).
         assert_eq!(install_count(&lines), 2, "each plugin installed once");
         assert_eq!(
             installs(&lines),
@@ -1305,16 +1015,14 @@ mod orchestration_tests {
                 "claude plugin install p2@M --scope user".to_string(),
             ])
         );
-        // …and strictly between the Claude `marketplace add` and the
-        // post-sync identity assertion's `list`.
         assert_installs_bracketed(
             &lines,
             &format!("claude plugin marketplace add {repo}"),
             Some("claude plugin marketplace list --json"),
         );
         assert_eq!(report.repo_root, f.repo);
-        assert_eq!(report.claude_name.as_deref(), Some("M"));
-        assert_eq!(report.codex_name.as_deref(), Some("M"));
+        assert_eq!(report.name(Runtime::Claude), Some("M"));
+        assert_eq!(report.name(Runtime::Codex), Some("M"));
         assert_eq!(report.plugins, vec!["p1", "p2"]);
         // CODEX_MKT sets no `policy.installation` ⇒ Codex registers the
         // marketplace but won't auto-install these; the advisory surfaces
@@ -1370,7 +1078,7 @@ mod orchestration_tests {
             &crate::output::NoopReporter,
         )
         .unwrap();
-        assert_eq!(report.codex_name.as_deref(), Some("M"));
+        assert_eq!(report.name(Runtime::Codex), Some("M"));
         assert!(r
             .lines()
             .contains(&format!("codex plugin marketplace add {}", f.repo)));
@@ -1407,7 +1115,7 @@ mod orchestration_tests {
         )
         .unwrap();
 
-        assert_eq!(report.claude_name.as_deref(), Some("M"));
+        assert_eq!(report.name(Runtime::Claude), Some("M"));
         assert!(
             !r.lines()
                 .iter()
@@ -1478,7 +1186,6 @@ mod orchestration_tests {
         let err = sync(&r, &f.repo, &f.codex_cfg, &f.cfg, &rep)
             .expect_err("sync should fail when plugin 2 fails to install")
             .to_string();
-        // The failure is aggregated and names the offending plugin + stderr.
         assert!(
             err.contains("p2@M"),
             "error should name the failed plugin: {err}"
@@ -1489,7 +1196,6 @@ mod orchestration_tests {
         );
 
         let trail = rep.lines.lock().unwrap();
-        // The completed steps remain visible; p2 never got a line.
         assert!(trail.iter().any(|l| l == "Codex   ~ M"), "{trail:?}");
         assert!(trail.iter().any(|l| l == "Claude  ~ M"), "{trail:?}");
         assert!(trail.iter().any(|l| l == "+ p1"), "{trail:?}");
@@ -1499,8 +1205,6 @@ mod orchestration_tests {
     #[test]
     fn sync_runs_all_installs_even_when_one_fails() {
         let f = fixture();
-        // p1 fails; p2 must still be attempted and succeed — proving the
-        // fan-out collects failures instead of bailing on the first one.
         let r = happy_runner(&f.repo).on(
             |p, a| p == "claude" && a.contains(&"install") && a.iter().any(|x| x.contains("p1@")),
             CommandOutput::fail(1, "p1 exploded"),
@@ -1597,10 +1301,10 @@ mod orchestration_tests {
         assert_eq!(snap.repo.branch, "pr-123");
         assert!(snap.repo.dirty);
         assert_eq!(snap.default_branch, "main");
-        assert_eq!(s.claude_name.as_deref(), Some("M"));
-        assert_eq!(s.codex_name.as_deref(), Some("M"));
-        assert_eq!(s.claude_pointed_at.as_deref(), Some(f.repo.as_str()));
-        assert_eq!(s.codex_pointed_at.as_deref(), Some(f.repo.as_str()));
+        assert_eq!(s.name(Runtime::Claude), Some("M"));
+        assert_eq!(s.name(Runtime::Codex), Some("M"));
+        assert_eq!(s.pointed_at(Runtime::Claude), Some(f.repo.as_str()));
+        assert_eq!(s.pointed_at(Runtime::Codex), Some(f.repo.as_str()));
     }
 
     #[test]
@@ -1611,33 +1315,17 @@ mod orchestration_tests {
         assert!(!s.snapshot.as_ref().expect("in a repo").remote_matches);
     }
 
-    /// Stub [`MarketplacePair`]: hands `reset_with` canned marketplaces so the
-    /// shallow-clone + filesystem step never needs real git or a network.
-    struct StubPair {
-        claude: Option<Marketplace>,
-        codex: Option<Marketplace>,
-        codex_unactivated: Vec<String>,
+    /// Stub [`CheckoutSource`]: hands `reset_with` a pre-populated directory
+    /// so the shallow-clone + filesystem step never needs real git.
+    struct StubCheckout {
+        dir: Utf8PathBuf,
     }
-    impl MarketplacePair for StubPair {
-        fn load(&self, _cfg: &Config) -> Result<LoadedMarketplaces> {
-            Ok(LoadedMarketplaces {
-                claude: self.claude.clone(),
-                codex: self.codex.clone(),
-                codex_unactivated: self.codex_unactivated.clone(),
-            })
-        }
-    }
-    fn mkt(name: &str, plugins: &[&str]) -> Marketplace {
-        Marketplace {
-            name: name.into(),
-            plugins: plugins.iter().map(|s| s.to_string()).collect(),
-        }
-    }
-    fn both_mkts() -> StubPair {
-        StubPair {
-            claude: Some(mkt("M", &["p1", "p2"])),
-            codex: Some(mkt("M", &["p1", "p2"])),
-            codex_unactivated: Vec::new(),
+    impl CheckoutSource for StubCheckout {
+        fn with_checkout(
+            &self,
+            read: &mut dyn FnMut(&Utf8Path) -> Result<BTreeMap<Runtime, Validated>>,
+        ) -> Result<BTreeMap<Runtime, Validated>> {
+            read(&self.dir)
         }
     }
 
@@ -1666,11 +1354,11 @@ mod orchestration_tests {
 
         assert!(s.snapshot.is_none(), "no snapshot outside a repo");
         assert_eq!(s.configured_remote, "git@github.com:co/agent-mkt.git");
-        assert_eq!(s.claude_name.as_deref(), Some("M"));
-        assert_eq!(s.codex_name.as_deref(), Some("M"));
-        assert_eq!(s.claude_pointed_at.as_deref(), Some("co/agent-mkt"));
+        assert_eq!(s.name(Runtime::Claude), Some("M"));
+        assert_eq!(s.name(Runtime::Codex), Some("M"));
+        assert_eq!(s.pointed_at(Runtime::Claude), Some("co/agent-mkt"));
         assert_eq!(
-            s.codex_pointed_at.as_deref(),
+            s.pointed_at(Runtime::Codex),
             Some("git@github.com:co/agent-mkt.git")
         );
     }
@@ -1683,8 +1371,12 @@ mod orchestration_tests {
             |p, a| p == "claude" && a.contains(&"list"),
             CommandOutput::ok(r#"[{ "name": "M", "source": "github" }]"#),
         );
+        let src = StubCheckout {
+            dir: f.repo.clone(),
+        };
 
-        let report = reset_with(&r, &f.cfg, &both_mkts(), &crate::output::NoopReporter).unwrap();
+        let report =
+            reset_with(&r, &f.codex_cfg, &f.cfg, &src, &crate::output::NoopReporter).unwrap();
 
         assert_eq!(report.source, "git@github.com:co/agent-mkt.git");
         assert_eq!(report.plugins, vec!["p1", "p2"]);
@@ -1707,7 +1399,6 @@ mod orchestration_tests {
                 "claude plugin install p2@M --scope user".to_string(),
             ])
         );
-        // reset has no post-assert `list`; installs are simply after the add.
         assert_installs_bracketed(
             &lines,
             "claude plugin marketplace add git@github.com:co/agent-mkt.git",
@@ -1717,17 +1408,20 @@ mod orchestration_tests {
 
     #[test]
     fn reset_accepts_a_nested_gitlab_remote() {
-        // A nested GitLab group/subgroup/repo remote — the >3-path-segment
-        // case the old `owner/repo` slug parser rejected. Passed through whole.
+        // A nested GitLab group/subgroup/repo remote — passed through whole.
         let url = "git@gitlab.com:company/team/agent-marketplace.git";
         let mut f = fixture();
-        f.cfg = Config::new(url, true, true);
+        f.cfg = Config::new(url, [Runtime::Codex, Runtime::Claude]);
         let r = RecordingRunner::new().on(
             |p, a| p == "claude" && a.contains(&"list"),
             CommandOutput::ok("[]"),
         );
+        let src = StubCheckout {
+            dir: f.repo.clone(),
+        };
 
-        let report = reset_with(&r, &f.cfg, &both_mkts(), &crate::output::NoopReporter).unwrap();
+        let report =
+            reset_with(&r, &f.codex_cfg, &f.cfg, &src, &crate::output::NoopReporter).unwrap();
 
         assert_eq!(report.source, url);
         let lines = agent_lines(&r.lines());
@@ -1743,16 +1437,18 @@ mod orchestration_tests {
 
     #[test]
     fn reset_makes_no_git_calls_so_it_works_without_a_repo() {
-        // reset is a recovery command: it derives its target from config and
-        // (in production) shallow-clones the remote. With the source stubbed
-        // it must touch git *zero* times — proving it can't depend on cwd,
-        // an `origin` remote, or being inside a worktree at all.
+        // reset is a recovery command: with the checkout stubbed it must
+        // touch git *zero* times — proving it can't depend on cwd, an
+        // `origin` remote, or being inside a worktree at all.
         let f = fixture();
         let r = RecordingRunner::new().on(
             |p, a| p == "claude" && a.contains(&"list"),
             CommandOutput::ok("[]"),
         );
-        assert!(reset_with(&r, &f.cfg, &both_mkts(), &crate::output::NoopReporter).is_ok());
+        let src = StubCheckout {
+            dir: f.repo.clone(),
+        };
+        assert!(reset_with(&r, &f.codex_cfg, &f.cfg, &src, &crate::output::NoopReporter).is_ok());
         assert!(
             !r.lines().iter().any(|l| l.starts_with("git ")),
             "reset must make no git calls, saw: {:?}",
@@ -1763,24 +1459,36 @@ mod orchestration_tests {
     #[test]
     fn reset_clone_command_is_shaped_correctly() {
         // The real `RemoteClone` read path: a scripted-success `git clone`
-        // plus a pre-populated checkout dir (the fake runner writes no
-        // files, so `load_from` is pointed at a dir we populate ourselves).
+        // plus a pre-populated checkout dir.
         let (_d, dir) = tmp();
         std::fs::create_dir_all(dir.join(".claude-plugin")).unwrap();
         std::fs::create_dir_all(dir.join(".agents/plugins")).unwrap();
         std::fs::write(dir.join(".claude-plugin/marketplace.json"), CLAUDE_MKT).unwrap();
         std::fs::write(dir.join(".agents/plugins/marketplace.json"), CODEX_MKT).unwrap();
-        let cfg = Config::new("git@github.com:co/agent-mkt.git", true, true);
+        let cfg = Config::new(
+            "git@github.com:co/agent-mkt.git",
+            [Runtime::Codex, Runtime::Claude],
+        );
         let r = RecordingRunner::new().on(
             |p, a| p == "git" && a.contains(&"clone"),
             CommandOutput::ok(""),
         );
+        let codex_cfg = Utf8Path::new("/no/codex.toml");
+        let targets = managed_targets(&cfg, &r, codex_cfg);
 
         let clone = RemoteClone {
             runner: &r,
             remote: "git@github.com:co/agent-mkt.git",
         };
-        let loaded = clone.load_from(&cfg, &dir).unwrap();
+        let loaded = clone
+            .clone_then(&dir, |d| {
+                let mut m = BTreeMap::new();
+                for t in &targets {
+                    m.insert(t.runtime(), t.read(d)?);
+                }
+                Ok(m)
+            })
+            .unwrap();
 
         assert_eq!(
             r.lines(),
@@ -1788,17 +1496,22 @@ mod orchestration_tests {
                 "git clone --depth 1 -- git@github.com:co/agent-mkt.git {dir}"
             )]
         );
-        assert_eq!(loaded.claude.unwrap().plugins, vec!["p1", "p2"]);
-        assert_eq!(loaded.codex.unwrap().name, "M");
+        assert_eq!(
+            loaded[&Runtime::Claude].marketplace.plugins,
+            vec!["p1", "p2"]
+        );
+        assert_eq!(loaded[&Runtime::Codex].marketplace.name, "M");
         // CODEX_MKT declares no `policy.installation` ⇒ every plugin is
         // available-but-not-installed; the advisory must surface them.
-        assert_eq!(loaded.codex_unactivated, vec!["p1", "p2"]);
+        assert_eq!(
+            loaded[&Runtime::Codex].advisories,
+            vec!["p1".to_string(), "p2".to_string()]
+        );
     }
 
     #[test]
     fn reset_surfaces_a_clear_error_when_clone_fails() {
         let (_d, dir) = tmp();
-        let cfg = Config::new("git@github.com:co/agent-mkt.git", true, true);
         let r = RecordingRunner::new().on(
             |p, a| p == "git" && a.contains(&"clone"),
             CommandOutput::fail(128, "fatal: Could not read from remote repository"),
@@ -1807,7 +1520,10 @@ mod orchestration_tests {
             runner: &r,
             remote: "git@github.com:co/agent-mkt.git",
         };
-        let err = clone.load_from(&cfg, &dir).unwrap_err().to_string();
+        let err = clone
+            .clone_then(&dir, |_d| -> Result<()> { Ok(()) })
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("git clone"), "{err}");
         assert!(err.contains("git@github.com:co/agent-mkt.git"), "{err}");
         assert!(
@@ -1820,9 +1536,9 @@ mod orchestration_tests {
     fn reset_rejects_an_unrecognizable_remote_before_cloning() {
         // A bad remote must fail at validation, before any temp dir or clone.
         let mut f = fixture();
-        f.cfg = Config::new("not-a-remote", true, true);
+        f.cfg = Config::new("not-a-remote", [Runtime::Codex, Runtime::Claude]);
         let r = RecordingRunner::new();
-        let err = reset(&r, &f.cfg, &crate::output::NoopReporter)
+        let err = reset(&r, &f.codex_cfg, &f.cfg, &crate::output::NoopReporter)
             .unwrap_err()
             .to_string();
         assert!(err.contains("not a recognizable git remote"), "{err}");
@@ -1894,15 +1610,15 @@ mod orchestration_tests {
         let report = init(&r, &repo, &cfg_path, false, TargetSelection::Auto).unwrap();
 
         assert_eq!(report.remote, "git@github.com:co/agent-mkt.git");
-        assert!(report.claude.enabled);
-        assert!(!report.codex.enabled);
+        assert!(report.outcome(Runtime::Claude).managed);
+        assert!(!report.outcome(Runtime::Codex).managed);
         assert_eq!(
-            report.codex.skip_reason.as_deref(),
+            report.outcome(Runtime::Codex).skip_reason.as_deref(),
             Some("no .agents/plugins/marketplace.json")
         );
         assert_eq!(
             Config::load(&cfg_path).unwrap(),
-            Config::new("git@github.com:co/agent-mkt.git", true, false)
+            Config::new("git@github.com:co/agent-mkt.git", [Runtime::Claude])
         );
     }
 
@@ -1924,9 +1640,12 @@ mod orchestration_tests {
 
         let report = init(&r, &repo, &cfg_path, false, TargetSelection::Auto).unwrap();
 
-        assert!(report.claude.enabled);
-        assert!(!report.codex.enabled);
-        assert_eq!(report.codex.skip_reason.as_deref(), Some("not on PATH"));
+        assert!(report.outcome(Runtime::Claude).managed);
+        assert!(!report.outcome(Runtime::Codex).managed);
+        assert_eq!(
+            report.outcome(Runtime::Codex).skip_reason.as_deref(),
+            Some("not on PATH")
+        );
     }
 
     #[test]
@@ -1941,18 +1660,25 @@ mod orchestration_tests {
             CommandOutput::fail(127, "command not found"),
         );
 
-        let report = init(&r, &repo, &cfg_path, false, TargetSelection::CodexOnly).unwrap();
+        let report = init(
+            &r,
+            &repo,
+            &cfg_path,
+            false,
+            TargetSelection::Only(Runtime::Codex),
+        )
+        .unwrap();
 
-        assert!(report.codex.enabled);
-        assert!(!report.codex.file_present);
-        assert!(!report.claude.enabled);
+        assert!(report.outcome(Runtime::Codex).managed);
+        assert!(!report.outcome(Runtime::Codex).file_present);
+        assert!(!report.outcome(Runtime::Claude).managed);
         assert_eq!(
-            report.claude.skip_reason.as_deref(),
+            report.outcome(Runtime::Claude).skip_reason.as_deref(),
             Some("excluded by --codex-only")
         );
         assert_eq!(
             Config::load(&cfg_path).unwrap(),
-            Config::new("git@github.com:co/r.git", false, true)
+            Config::new("git@github.com:co/r.git", [Runtime::Codex])
         );
     }
 

@@ -1,7 +1,17 @@
 //! Codex target: marketplace add/remove, structural pre-flight, config.toml.
+//!
+//! Codex's quirks, all local to this adapter: `marketplace remove` is
+//! unconditional and its exit 1 when absent is tolerated (a different source
+//! under the same name is otherwise refused); there is no per-plugin install
+//! command, so `apply` only re-points the marketplace and `validate` surfaces
+//! the plugins Codex won't auto-install as advisories.
 
+use super::{Marketplace, Target, Validated};
+use crate::command::CommandRunner;
+use crate::config::Runtime;
+use crate::output::{Event, Reporter};
 use anyhow::{bail, Context, Result};
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
 
 /// A `[marketplaces.<name>]` record from `~/.codex/config.toml` — Codex's
@@ -151,6 +161,106 @@ pub fn installation_advisory(json: &str) -> Result<Vec<String>> {
     Ok(not_installed)
 }
 
+pub struct CodexTarget<'a> {
+    pub runner: &'a dyn CommandRunner,
+    pub marketplace_file: Utf8PathBuf,
+    /// `~/.codex/config.toml` — Codex's only state surface (no `list` command).
+    pub config_path: Utf8PathBuf,
+}
+
+impl CodexTarget<'_> {
+    /// Read + structurally parse the marketplace once, returning the parsed
+    /// form and the raw JSON (the auth-policy validator and the advisory both
+    /// need the raw text). Kept private so the raw text never leaves this
+    /// adapter.
+    fn parsed(&self, dir: &Utf8Path) -> Result<(Marketplace, String)> {
+        let path = dir.join(&self.marketplace_file);
+        let raw = std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
+        let marketplace = Marketplace::parse(&raw).with_context(|| format!("in {path}"))?;
+        Ok((marketplace, raw))
+    }
+
+    /// The advisory step shared by `read` and `validate`, working off an
+    /// already-parsed marketplace so neither re-reads the file.
+    fn advise(&self, dir: &Utf8Path, marketplace: Marketplace, raw: &str) -> Result<Validated> {
+        let advisories = installation_advisory(raw)
+            .with_context(|| format!("in {}", dir.join(&self.marketplace_file)))?;
+        Ok(Validated {
+            marketplace,
+            advisories,
+        })
+    }
+}
+
+impl Target for CodexTarget<'_> {
+    fn runtime(&self) -> Runtime {
+        Runtime::Codex
+    }
+
+    fn read(&self, dir: &Utf8Path) -> Result<Validated> {
+        // Structural only (reset's path): parse + advisory, no auth-policy
+        // validator. The raw JSON is parsed but never leaves this method.
+        let (marketplace, raw) = self.parsed(dir)?;
+        self.advise(dir, marketplace, &raw)
+    }
+
+    fn validate(&self, dir: &Utf8Path) -> Result<Validated> {
+        // Authoritative (sync's path): the structural read plus Codex's pinned
+        // auth-policy rule — the one thing we pre-empt before its destructive
+        // `add`. One read+parse, reused for all three checks.
+        let (marketplace, raw) = self.parsed(dir)?;
+        validate_marketplace_json(&raw)
+            .with_context(|| format!("in {}", dir.join(&self.marketplace_file)))?;
+        self.advise(dir, marketplace, &raw)
+    }
+
+    fn apply(
+        &self,
+        source: &str,
+        mkt: &Marketplace,
+        reporter: &dyn Reporter,
+    ) -> Result<Vec<String>> {
+        // `remove` is unconditional and its exit 1 (absent) is tolerated:
+        // Codex refuses a re-`add` of the same name pointing at a different
+        // source, so it must always be cleared first.
+        let _ = self.runner.run(
+            "codex",
+            &["plugin", "marketplace", "remove", &mkt.name],
+            None,
+        )?;
+        let add = self
+            .runner
+            .run("codex", &["plugin", "marketplace", "add", source], None)?;
+        if !add.success() {
+            bail!(
+                "`codex plugin marketplace add` failed: {}",
+                add.stderr.trim()
+            );
+        }
+        reporter.event(Event::Marketplace {
+            runtime: Runtime::Codex.label(),
+            name: &mkt.name,
+        });
+        // Codex has no per-plugin install command — it auto-installs per the
+        // marketplace's own policy. Nothing more for skillctl to do, and no
+        // plugins for skillctl to claim it installed.
+        Ok(Vec::new())
+    }
+
+    fn pointed_at(&self, name: &str) -> Result<Option<String>> {
+        Ok(read_marketplace(&self.config_path, name)?.map(|e| e.source))
+    }
+
+    fn registered_name_for(&self, remote: &str) -> Result<Option<String>> {
+        find_marketplace_by_source(&self.config_path, remote)
+    }
+
+    fn marketplace_name(&self, repo_root: &Utf8Path) -> Option<String> {
+        let raw = std::fs::read_to_string(repo_root.join(&self.marketplace_file)).ok()?;
+        Marketplace::parse(&raw).ok().map(|m| m.name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,5 +389,69 @@ source = "git@github.com:other/thing.git"
             { "name": "p2", "policy": { "installation": "INSTALLED_BY_DEFAULT" } }
         ] }"#;
         assert!(installation_advisory(json).unwrap().is_empty());
+    }
+
+    use crate::command::fake::RecordingRunner;
+    use crate::command::CommandOutput;
+    use crate::output::RecordingReporter;
+
+    fn mkt(name: &str) -> Marketplace {
+        Marketplace {
+            name: name.into(),
+            plugins: vec!["p1".into(), "p2".into()],
+        }
+    }
+
+    #[test]
+    fn apply_tolerates_remove_exit_1_then_adds_and_emits_no_installs() {
+        let r = RecordingRunner::new().on(
+            |p, a| p == "codex" && a.contains(&"remove"),
+            CommandOutput::fail(1, "marketplace not found"),
+        );
+        let t = CodexTarget {
+            runner: &r,
+            marketplace_file: ".agents/plugins/marketplace.json".into(),
+            config_path: "/no/codex.toml".into(),
+        };
+        let rep = RecordingReporter::default();
+
+        t.apply("git@github.com:co/m.git", &mkt("M"), &rep).unwrap();
+
+        let lines = r.lines();
+        assert!(
+            lines.contains(&"codex plugin marketplace add git@github.com:co/m.git".to_string()),
+            "exit-1 remove must NOT abort the add: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("plugin install")),
+            "Codex has no per-plugin install: {lines:?}"
+        );
+        assert!(rep.lines.lock().unwrap().iter().any(|l| l == "Codex   ~ M"));
+    }
+
+    #[test]
+    fn validate_surfaces_the_auto_install_advisory() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = camino::Utf8Path::from_path(dir.path()).unwrap();
+        std::fs::create_dir_all(d.join(".agents/plugins")).unwrap();
+        std::fs::write(
+            d.join(".agents/plugins/marketplace.json"),
+            r#"{ "name": "M", "plugins": [
+                { "name": "p1", "policy": { "authentication": "ON_INSTALL" } },
+                { "name": "p2", "policy": { "authentication": "ON_INSTALL" } } ] }"#,
+        )
+        .unwrap();
+        let r = RecordingRunner::new();
+        let t = CodexTarget {
+            runner: &r,
+            marketplace_file: ".agents/plugins/marketplace.json".into(),
+            config_path: "/no/codex.toml".into(),
+        };
+
+        let v = t.validate(d).unwrap();
+
+        assert_eq!(v.marketplace.name, "M");
+        // No `policy.installation` ⇒ available-but-not-installed; surfaced.
+        assert_eq!(v.advisories, vec!["p1".to_string(), "p2".to_string()]);
     }
 }

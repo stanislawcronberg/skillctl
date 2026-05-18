@@ -6,21 +6,26 @@
 //! uv's approach), so every renderer here stays testable as plain text.
 
 use crate::command::{InitReport, StatusReport, SyncReport};
+use crate::config::Runtime;
 use camino::Utf8Path;
 use owo_colors::OwoColorize;
 #[cfg(test)]
 use std::sync::Mutex;
 use std::time::Duration;
 
-/// The enabled runtimes, named for a user-facing sentence: `"Claude and
+/// The managed runtimes, named for a user-facing sentence: `"Claude and
 /// Codex"` / `"Claude"` / `"Codex"`. Scopes every restart message so a
 /// Codex-only user is never told to restart a Claude they don't run.
-fn runtimes_phrase(claude: bool, codex: bool) -> &'static str {
-    match (claude, codex) {
-        (true, true) => "Claude and Codex",
-        (true, false) => "Claude",
-        (false, true) => "Codex",
-        (false, false) => "the configured runtimes",
+fn runtimes_phrase(managed: &[Runtime]) -> String {
+    let names: Vec<&str> = [Runtime::Claude, Runtime::Codex]
+        .iter()
+        .filter(|r| managed.contains(r))
+        .map(|r| r.label())
+        .collect();
+    match names.as_slice() {
+        [] => "the configured runtimes".to_string(),
+        [one] => one.to_string(),
+        _ => format!("{} and {}", names[0], names[1]),
     }
 }
 
@@ -259,7 +264,7 @@ impl Reporter for RecordingReporter {
 /// "Synced 0 plugins"; and the restart reminder is folded into this one line
 /// (uv-style) naming only the enabled runtimes, so it reads as the expected
 /// next step rather than a separate `warning:` for something that went wrong.
-pub fn sync_summary(report: &SyncReport, took: Duration, claude: bool, codex: bool) -> String {
+pub fn sync_summary(report: &SyncReport, took: Duration, managed: &[Runtime]) -> String {
     let what = match report.plugins.len() {
         0 => "Codex marketplace".to_string(),
         n => format!("{n} plugin{}", if n == 1 { "" } else { "s" }),
@@ -269,17 +274,17 @@ pub fn sync_summary(report: &SyncReport, took: Duration, claude: bool, codex: bo
         "Synced".green().bold(),
         what.bold(),
         elapsed(took).dimmed(),
-        format!("— restart {} to load", runtimes_phrase(claude, codex)).dimmed(),
+        format!("— restart {} to load", runtimes_phrase(managed)).dimmed(),
     )
 }
 
-pub fn reset_summary(source: &str, took: Duration, claude: bool, codex: bool) -> String {
+pub fn reset_summary(source: &str, took: Duration, managed: &[Runtime]) -> String {
     format!(
         "\n  {} {} in {} {}",
         "Reset".green().bold(),
         format_args!("→ {source} (default branch)").bold(),
         elapsed(took).dimmed(),
-        format!("— restart {} to load", runtimes_phrase(claude, codex)).dimmed(),
+        format!("— restart {} to load", runtimes_phrase(managed)).dimmed(),
     )
 }
 
@@ -386,14 +391,15 @@ pub fn render_status(s: &StatusReport) -> String {
         }
     };
 
-    out.push_str(&row(
-        "Claude",
-        target_cell(s.claude_enabled, &s.claude_name, &s.claude_pointed_at, wt),
-    ));
-    out.push_str(&row(
-        "Codex",
-        target_cell(s.codex_enabled, &s.codex_name, &s.codex_pointed_at, wt),
-    ));
+    // Display order is Claude then Codex (presentation only — split-brain
+    // order is an orchestration concern). A runtime absent from the report
+    // is unmanaged and reads `(not managed)`, never broken.
+    for rt in [Runtime::Claude, Runtime::Codex] {
+        let ts = s.target(rt);
+        let name = ts.map(|t| t.name.clone()).unwrap_or(None);
+        let src = ts.map(|t| t.pointed_at.clone()).unwrap_or(None);
+        out.push_str(&row(rt.label(), target_cell(ts.is_some(), &name, &src, wt)));
+    }
     let default_branch = s
         .snapshot
         .as_ref()
@@ -419,29 +425,35 @@ pub fn render_init(report: &InitReport) -> String {
     out.push_str(&row("remote", &report.remote));
     out.push_str(&row("branch", &report.default_branch));
 
-    let targets = [("claude", &report.claude), ("codex", &report.codex)];
+    // Display order Claude then Codex; the lowercase key is the user-facing
+    // runtime name in this report.
+    let order = [Runtime::Claude, Runtime::Codex];
 
-    let enabled: Vec<&str> = targets
+    let managed: Vec<&str> = order
         .iter()
-        .filter(|(_, t)| t.enabled)
-        .map(|(n, _)| *n)
+        .filter(|r| report.outcome(**r).managed)
+        .map(|r| r.key())
         .collect();
-    out.push_str(&row("targets", enabled.join(", ")));
+    out.push_str(&row("targets", managed.join(", ")));
 
     // A dimmed reason for anything skipped — the "you're only managing X"
     // signal, at the moment the decision is made.
-    for (name, t) in targets {
+    for r in order {
+        let t = report.outcome(r);
         if let Some(reason) = &t.skip_reason {
+            let name = r.key();
             out.push_str(&format!(
                 "  {}\n",
                 format!("{:<LABEL_W$} {name} — {reason}", "skipped").dimmed()
             ));
         }
     }
-    // An enabled target whose file is absent (only reachable via an explicit
+    // A managed target whose file is absent (only reachable via an explicit
     // --*-only override) still works once that file lands — warn, don't fail.
-    for (name, t) in targets {
-        if t.enabled && !t.file_present {
+    for r in order {
+        let t = report.outcome(r);
+        if t.managed && !t.file_present {
+            let name = r.key();
             out.push_str(&format!(
                 "  {}\n",
                 warning(&format!(
@@ -456,11 +468,27 @@ pub fn render_init(report: &InitReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::RepoSnapshot;
+    use crate::command::{RepoSnapshot, TargetOutcome, TargetStatus};
     use crate::git::RepoState;
+    use std::collections::BTreeMap;
 
     fn plain(s: &str) -> String {
         anstream::adapter::strip_str(s).to_string()
+    }
+
+    /// One status row's data; absence from the report's `targets` map is what
+    /// renders `(not managed)`.
+    fn st(name: Option<&str>, pointed: Option<&str>) -> TargetStatus {
+        TargetStatus {
+            name: name.map(str::to_string),
+            pointed_at: pointed.map(str::to_string),
+        }
+    }
+
+    fn targets(
+        pairs: impl IntoIterator<Item = (Runtime, TargetStatus)>,
+    ) -> BTreeMap<Runtime, TargetStatus> {
+        pairs.into_iter().collect()
     }
 
     #[test]
@@ -530,12 +558,10 @@ mod tests {
                 remote_matches: false,
                 default_branch: "main".into(),
             }),
-            claude_enabled: true,
-            codex_enabled: true,
-            claude_name: Some("M".into()),
-            codex_name: None,
-            claude_pointed_at: Some("/work/wt".into()),
-            codex_pointed_at: None,
+            targets: targets([
+                (Runtime::Claude, st(Some("M"), Some("/work/wt"))),
+                (Runtime::Codex, st(None, None)),
+            ]),
         };
         let txt = plain(&render_status(&s));
         assert!(txt.contains("✗ does NOT match configured remote"), "{txt}");
@@ -572,12 +598,10 @@ mod tests {
                 remote_matches: true,
                 default_branch: "main".into(),
             }),
-            claude_enabled: true,
-            codex_enabled: true,
-            claude_name: Some("M".into()),
-            codex_name: None,
-            claude_pointed_at: Some("/some/OTHER/path".into()),
-            codex_pointed_at: None,
+            targets: targets([
+                (Runtime::Claude, st(Some("M"), Some("/some/OTHER/path"))),
+                (Runtime::Codex, st(None, None)),
+            ]),
         };
         let txt = plain(&render_status(&s));
         assert!(txt.contains("✓ matches configured remote"), "{txt}");
@@ -599,12 +623,8 @@ mod tests {
                 remote_matches: true,
                 default_branch: "main".into(),
             }),
-            claude_enabled: false,
-            codex_enabled: true,
-            claude_name: None,
-            codex_name: Some("M".into()),
-            claude_pointed_at: None,
-            codex_pointed_at: Some("/work/wt".into()),
+            // Claude unmanaged ⇒ absent from the map ⇒ renders (not managed).
+            targets: targets([(Runtime::Codex, st(Some("M"), Some("/work/wt")))]),
         };
         let txt = plain(&render_status(&s));
         assert!(txt.contains("Claude   (not managed)"), "{txt}");
@@ -622,12 +642,13 @@ mod tests {
         let s = StatusReport {
             configured_remote: "git@github.com:co/agent-mkt.git".into(),
             snapshot: None,
-            claude_enabled: true,
-            codex_enabled: true,
-            claude_name: Some("M".into()),
-            codex_name: Some("M".into()),
-            claude_pointed_at: Some("co/agent-mkt".into()),
-            codex_pointed_at: Some("git@github.com:co/agent-mkt.git".into()),
+            targets: targets([
+                (Runtime::Claude, st(Some("M"), Some("co/agent-mkt"))),
+                (
+                    Runtime::Codex,
+                    st(Some("M"), Some("git@github.com:co/agent-mkt.git")),
+                ),
+            ]),
         };
         let txt = plain(&render_status(&s));
         assert!(!txt.contains("worktree"), "no worktree row: {txt}");
@@ -651,12 +672,16 @@ mod tests {
         );
     }
 
-    fn outcome(enabled: bool, file: bool, reason: Option<&str>) -> crate::command::TargetOutcome {
-        crate::command::TargetOutcome {
-            enabled,
+    fn outcome(managed: bool, file: bool, reason: Option<&str>) -> TargetOutcome {
+        TargetOutcome {
+            managed,
             file_present: file,
             skip_reason: reason.map(str::to_string),
         }
+    }
+
+    fn outcomes(claude: TargetOutcome, codex: TargetOutcome) -> BTreeMap<Runtime, TargetOutcome> {
+        BTreeMap::from([(Runtime::Claude, claude), (Runtime::Codex, codex)])
     }
 
     #[test]
@@ -666,8 +691,10 @@ mod tests {
             remote: "git@github.com:co/r.git".into(),
             default_branch: "main".into(),
             config_path: "/cfg.toml".into(),
-            claude: outcome(false, false, Some("not on PATH")),
-            codex: outcome(true, true, None),
+            outcomes: outcomes(
+                outcome(false, false, Some("not on PATH")),
+                outcome(true, true, None),
+            ),
         };
         let txt = plain(&render_init(&report));
         assert!(txt.contains("targets  codex"), "{txt}");
@@ -679,14 +706,16 @@ mod tests {
     }
 
     #[test]
-    fn init_warns_when_an_enabled_target_has_no_marketplace_file() {
+    fn init_warns_when_a_managed_target_has_no_marketplace_file() {
         let report = InitReport {
             repo_root: "/repo".into(),
             remote: "r".into(),
             default_branch: "main".into(),
             config_path: "/cfg.toml".into(),
-            claude: outcome(false, false, Some("excluded by --codex-only")),
-            codex: outcome(true, false, None),
+            outcomes: outcomes(
+                outcome(false, false, Some("excluded by --codex-only")),
+                outcome(true, false, None),
+            ),
         };
         let txt = plain(&render_init(&report));
         assert!(txt.contains("targets  codex"), "{txt}");
@@ -697,18 +726,20 @@ mod tests {
     }
 
     #[test]
-    fn runtimes_phrase_names_only_the_enabled_runtimes() {
-        assert_eq!(runtimes_phrase(true, true), "Claude and Codex");
-        assert_eq!(runtimes_phrase(true, false), "Claude");
-        assert_eq!(runtimes_phrase(false, true), "Codex");
+    fn runtimes_phrase_names_only_the_managed_runtimes() {
+        assert_eq!(
+            runtimes_phrase(&[Runtime::Claude, Runtime::Codex]),
+            "Claude and Codex"
+        );
+        assert_eq!(runtimes_phrase(&[Runtime::Claude]), "Claude");
+        assert_eq!(runtimes_phrase(&[Runtime::Codex]), "Codex");
     }
 
     #[test]
     fn sync_summary_does_not_say_zero_plugins_for_a_codex_only_sync() {
         let codex_only = SyncReport {
             repo_root: "/r".into(),
-            claude_name: None,
-            codex_name: Some("M".into()),
+            names: BTreeMap::from([(Runtime::Codex, "M".to_string())]),
             plugins: vec![],
             codex_unactivated_plugins: vec![],
         };
@@ -716,8 +747,7 @@ mod tests {
         let txt = plain(&sync_summary(
             &codex_only,
             Duration::from_millis(5),
-            false,
-            true,
+            &[Runtime::Codex],
         ));
         assert!(txt.contains("Synced Codex marketplace in"), "{txt}");
         assert!(!txt.contains("0 plugin"), "{txt}");
@@ -730,8 +760,7 @@ mod tests {
         let txt = plain(&sync_summary(
             &with_plugins,
             Duration::from_millis(5),
-            true,
-            true,
+            &[Runtime::Claude, Runtime::Codex],
         ));
         assert!(txt.contains("Synced 1 plugin in"), "{txt}");
         assert!(txt.contains("— restart Claude and Codex to load"), "{txt}");
@@ -758,8 +787,7 @@ mod tests {
         let txt = plain(&reset_summary(
             "git@github.com:co/r.git",
             Duration::from_secs(2),
-            true,
-            false,
+            &[Runtime::Claude],
         ));
         assert!(
             txt.contains("Reset → git@github.com:co/r.git (default branch) in"),

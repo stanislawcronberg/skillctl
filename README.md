@@ -58,24 +58,22 @@ skillctl reset     # snap both back to the default branch (runs from anywhere)
 ## Configuration
 
 `skillctl init` writes `~/.config/skillctl/config.toml` (honoring
-`$XDG_CONFIG_HOME`) — you rarely need to edit it by hand. Each target carries
-an `enabled` flag set from detection (or `--claude-only` / `--codex-only`);
-`sync`, `reset`, and `status` only touch enabled runtimes, and flipping
-`enabled` by hand is a supported way to add or drop one without re-running
-`init`:
+`$XDG_CONFIG_HOME`) — you rarely need to edit it by hand. **A runtime is
+managed if (and only if) its `[targets.<runtime>]` table is present** — there
+is no `enabled` flag. `sync`, `reset`, and `status` act on exactly the
+runtimes that have a table, so dropping a runtime is just deleting its table
+(and adding one back, or re-running `init`, restores it). A Codex-only
+machine simply has no `[targets.claude]` table:
 
 ```toml
 [repo]
 remote = "git@github.com:company/agent-marketplace.git"
 
-[targets.claude]
-enabled = true
-scope = "user"
-marketplace_file = ".claude-plugin/marketplace.json"
-
 [targets.codex]
-enabled = true
 marketplace_file = ".agents/plugins/marketplace.json"
+
+[targets.claude]
+marketplace_file = ".claude-plugin/marketplace.json"
 ```
 
 `sync` refuses to run if the worktree's `origin` doesn't match the configured
