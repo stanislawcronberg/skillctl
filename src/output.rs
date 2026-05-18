@@ -9,7 +9,7 @@ use crate::command::{InitReport, StatusReport, SyncReport};
 use camino::Utf8Path;
 use owo_colors::OwoColorize;
 #[cfg(test)]
-use std::cell::RefCell;
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// The enabled runtimes, named for a user-facing sentence: `"Claude and
@@ -22,22 +22,6 @@ fn runtimes_phrase(claude: bool, codex: bool) -> &'static str {
         (false, true) => "Codex",
         (false, false) => "the configured runtimes",
     }
-}
-
-/// Restart is *always* required — skillctl never inspects a running runtime.
-pub fn restart_notice(claude: bool, codex: bool) -> String {
-    format!(
-        "not live until you restart {}",
-        runtimes_phrase(claude, codex)
-    )
-}
-
-/// The advisory variant `status` prints (no mutation just happened).
-pub fn restart_reminder(claude: bool, codex: bool) -> String {
-    format!(
-        "restart {} after any sync/reset",
-        runtimes_phrase(claude, codex)
-    )
 }
 
 /// Human-readable elapsed time: `12ms`, `1.34s`, `1m 05s`.
@@ -131,16 +115,92 @@ pub fn render_event(e: &Event) -> String {
     }
 }
 
-pub trait Reporter {
+/// `Send + Sync` so the scoped install-fan-out threads can all report
+/// completed plugins through one shared `&dyn Reporter`. `finish` is a
+/// lifecycle hook the spinner reporter uses to clear itself before the
+/// caller prints the summary; non-interactive reporters keep the no-op.
+pub trait Reporter: Send + Sync {
     fn event(&self, e: Event);
+    fn finish(&self) {}
 }
 
-/// Production reporter: styles + flushes each event to stderr immediately, so
-/// a failure mid-`sync` leaves a readable record of what already happened.
+/// Non-interactive reporter: styles + flushes each event to stderr
+/// immediately, so a failure mid-`sync` leaves a readable record of what
+/// already happened. Used when stderr is not a TTY (pipes/CI) or `NO_COLOR`
+/// is set, keeping that output byte-for-byte what it was before the spinner.
 pub struct StderrReporter;
 impl Reporter for StderrReporter {
     fn event(&self, e: Event) {
         anstream::eprintln!("{}", render_event(&e));
+    }
+}
+
+/// Interactive reporter: an `indicatif` spinner pinned at the bottom of the
+/// terminal that keeps animating through the long *silent* steps (`claude
+/// plugin validate`, the marketplace `add`, the parallel installs) where no
+/// event fires. Each finalized event is printed as a permanent line *above*
+/// the live spinner via `ProgressBar::println`, reusing the exact
+/// `render_event` styling — so the trail still survives a mid-sequence
+/// failure, exactly like [`StderrReporter`]. `finish` clears the spinner so
+/// the caller's summary (or an error report) is never drawn over a live
+/// frame. `indicatif::ProgressBar` is internally synchronized, so the
+/// install-fan-out threads can all report through one `&ProgressReporter`.
+pub struct ProgressReporter {
+    bar: indicatif::ProgressBar,
+}
+
+/// The phase the spinner is *about to* spend its silent time in, named after
+/// the event that just completed — so the live line tracks the slow step
+/// underway (no per-step "start" signal exists; events fire on completion).
+fn phase_after(e: &Event) -> &'static str {
+    match e {
+        // Target is announced before any mutation: next come the marketplace
+        // remove/add calls.
+        Event::Target { .. } => "linking runtimes…",
+        // Claude's marketplace is now set → the install fan-out runs next;
+        // Codex's marketplace event still precedes Claude's link.
+        Event::Marketplace {
+            runtime: "Claude", ..
+        } => "installing plugins…",
+        Event::Marketplace { .. } => "linking runtimes…",
+        Event::Plugin { .. } => "installing plugins…",
+    }
+}
+
+#[allow(clippy::new_without_default)] // constructing one starts a live ticker
+impl ProgressReporter {
+    pub fn new() -> Self {
+        let bar = indicatif::ProgressBar::new_spinner();
+        bar.enable_steady_tick(Duration::from_millis(100));
+        // The longest silent stretch in `sync` is pre-flight's `claude plugin
+        // validate`, which runs before the first event; `reset` only reads &
+        // parses here. "checking marketplace…" is accurate for both.
+        bar.set_message("checking marketplace…");
+        Self { bar }
+    }
+}
+
+impl Reporter for ProgressReporter {
+    fn event(&self, e: Event) {
+        // `bar.println` adds its own newline and inserts the line above the
+        // live spinner; trim `render_event`'s trailing `\n` so a Target block
+        // doesn't leave a doubled blank line. (Its leading `\n` is kept — it
+        // is the intended separator before the header.)
+        self.bar.println(render_event(&e).trim_end_matches('\n'));
+        self.bar.set_message(phase_after(&e));
+    }
+    fn finish(&self) {
+        self.bar.finish_and_clear();
+    }
+}
+
+impl Drop for ProgressReporter {
+    /// Safety net: if `sync`/`reset` unwinds (e.g. a panic in a fan-out
+    /// thread) the explicit `finish()` is skipped, so clear the spinner on
+    /// drop too. `finish_and_clear` is idempotent, so on the normal path —
+    /// where `finish()` already ran before the summary — this is a no-op.
+    fn drop(&mut self) {
+        self.bar.finish_and_clear();
     }
 }
 
@@ -157,39 +217,44 @@ impl Reporter for NoopReporter {
 #[cfg(test)]
 #[derive(Default)]
 pub struct RecordingReporter {
-    pub lines: RefCell<Vec<String>>,
+    pub lines: Mutex<Vec<String>>,
 }
 #[cfg(test)]
 impl Reporter for RecordingReporter {
     fn event(&self, e: Event) {
         let plain = anstream::adapter::strip_str(&render_event(&e)).to_string();
-        self.lines.borrow_mut().push(plain.trim().to_string());
+        self.lines.lock().unwrap().push(plain.trim().to_string());
     }
 }
 
 // --- summaries (stderr, on success) -----------------------------------------
 
-/// Scope-aware: Claude installs per-plugin (count it), but a Codex-only sync
-/// installs no plugins — say what it *did* do instead of "Synced 0 plugins".
-pub fn sync_summary(report: &SyncReport, took: Duration) -> String {
+/// Scope-aware on two axes: Claude installs per-plugin (count it), but a
+/// Codex-only sync installs no plugins — say what it *did* do instead of
+/// "Synced 0 plugins"; and the restart reminder is folded into this one line
+/// (uv-style) naming only the enabled runtimes, so it reads as the expected
+/// next step rather than a separate `warning:` for something that went wrong.
+pub fn sync_summary(report: &SyncReport, took: Duration, claude: bool, codex: bool) -> String {
     let what = match report.plugins.len() {
         0 => "Codex marketplace".to_string(),
         n => format!("{n} plugin{}", if n == 1 { "" } else { "s" }),
     };
     format!(
-        "\n  {} {} in {}",
+        "\n  {} {} in {} {}",
         "Synced".green().bold(),
         what.bold(),
-        elapsed(took).dimmed()
+        elapsed(took).dimmed(),
+        format!("— restart {} to load", runtimes_phrase(claude, codex)).dimmed(),
     )
 }
 
-pub fn reset_summary(source: &str, took: Duration) -> String {
+pub fn reset_summary(source: &str, took: Duration, claude: bool, codex: bool) -> String {
     format!(
-        "\n  {} {} in {}",
+        "\n  {} {} in {} {}",
         "Reset".green().bold(),
         format_args!("→ {source} (default branch)").bold(),
-        elapsed(took).dimmed()
+        elapsed(took).dimmed(),
+        format!("— restart {} to load", runtimes_phrase(claude, codex)).dimmed(),
     )
 }
 
@@ -515,19 +580,10 @@ mod tests {
     }
 
     #[test]
-    fn restart_messaging_names_only_the_enabled_runtimes() {
-        assert_eq!(
-            restart_notice(true, true),
-            "not live until you restart Claude and Codex"
-        );
-        assert_eq!(
-            restart_notice(false, true),
-            "not live until you restart Codex"
-        );
-        assert_eq!(
-            restart_reminder(true, false),
-            "restart Claude after any sync/reset"
-        );
+    fn runtimes_phrase_names_only_the_enabled_runtimes() {
+        assert_eq!(runtimes_phrase(true, true), "Claude and Codex");
+        assert_eq!(runtimes_phrase(true, false), "Claude");
+        assert_eq!(runtimes_phrase(false, true), "Codex");
     }
 
     #[test]
@@ -538,18 +594,44 @@ mod tests {
             codex_name: Some("M".into()),
             plugins: vec![],
         };
-        let txt = plain(&sync_summary(&codex_only, Duration::from_millis(5)));
+        // Codex-only: no plugins counted, restart clause names only Codex.
+        let txt = plain(&sync_summary(
+            &codex_only,
+            Duration::from_millis(5),
+            false,
+            true,
+        ));
         assert!(txt.contains("Synced Codex marketplace in"), "{txt}");
         assert!(!txt.contains("0 plugin"), "{txt}");
+        assert!(txt.contains("— restart Codex to load"), "{txt}");
 
         let with_plugins = SyncReport {
             plugins: vec!["p1".into()],
             ..codex_only
         };
+        let txt = plain(&sync_summary(
+            &with_plugins,
+            Duration::from_millis(5),
+            true,
+            true,
+        ));
+        assert!(txt.contains("Synced 1 plugin in"), "{txt}");
+        assert!(txt.contains("— restart Claude and Codex to load"), "{txt}");
+    }
+
+    #[test]
+    fn reset_summary_folds_in_the_scope_aware_restart_clause() {
+        let txt = plain(&reset_summary(
+            "git@github.com:co/r.git",
+            Duration::from_secs(2),
+            true,
+            false,
+        ));
         assert!(
-            plain(&sync_summary(&with_plugins, Duration::from_millis(5)))
-                .contains("Synced 1 plugin in")
+            txt.contains("Reset → git@github.com:co/r.git (default branch) in"),
+            "{txt}"
         );
+        assert!(txt.contains("— restart Claude to load"), "{txt}");
     }
 
     #[test]
@@ -561,8 +643,40 @@ mod tests {
         });
         r.event(Event::Plugin { name: "p1" });
         assert_eq!(
-            *r.lines.borrow(),
+            *r.lines.lock().unwrap(),
             vec!["Codex   ~ M".to_string(), "+ p1".to_string()]
         );
+    }
+
+    #[test]
+    fn progress_reporter_event_is_safe_from_concurrent_fan_out_threads() {
+        // The install fan-out calls `event` from several scoped threads at
+        // once; prove that path is sound (indicatif is internally
+        // synchronized) and never panics. A hidden draw target keeps the test
+        // from drawing to the real terminal.
+        let pr = ProgressReporter::new();
+        pr.bar
+            .set_draw_target(indicatif::ProgressDrawTarget::hidden());
+        std::thread::scope(|s| {
+            for i in 0..8 {
+                let pr = &pr;
+                s.spawn(move || {
+                    let name = format!("p{i}");
+                    pr.event(Event::Plugin { name: &name });
+                });
+            }
+        });
+        pr.finish();
+    }
+
+    #[test]
+    fn progress_reporter_clears_on_drop_even_without_finish() {
+        // The panic-safety net: a reporter dropped during unwinding (so the
+        // explicit `finish()` never ran) must still tear down cleanly.
+        let pr = ProgressReporter::new();
+        pr.bar
+            .set_draw_target(indicatif::ProgressDrawTarget::hidden());
+        pr.event(Event::Plugin { name: "p1" });
+        drop(pr); // Drop::drop → finish_and_clear; must not panic
     }
 }

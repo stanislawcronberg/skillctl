@@ -24,7 +24,9 @@ impl CommandOutput {
     }
 }
 
-pub trait CommandRunner {
+/// `Send + Sync` so a single `&dyn CommandRunner` can be shared across the
+/// scoped threads that fan out Claude's plugin installs ([`apply_marketplace`]).
+pub trait CommandRunner: Send + Sync {
     /// Run `program args...` (optionally in `cwd`) to completion. Returns
     /// `Err` only when the process could not be spawned at all; a non-zero
     /// exit is reported via [`CommandOutput::status`], never as `Err`.
@@ -357,20 +359,58 @@ fn apply_marketplace(
             runtime: "Claude",
             name: &m.name,
         });
-        for p in &m.plugins {
-            let spec = format!("{p}@{}", m.name);
-            let inst = runner.run(
-                "claude",
-                &["plugin", "install", &spec, "--scope", scope],
-                None,
-            )?;
-            if !inst.success() {
-                bail!(
-                    "`claude plugin install {spec}` failed: {}",
-                    inst.stderr.trim()
-                );
+
+        // Each `claude plugin install` is independent and purely additive, so
+        // fan them out across a bounded pool of scoped threads rather than
+        // paying the CLI cold-start serially. A shared atomic cursor caps
+        // in-flight installs at `MAX_INSTALL_CONCURRENCY` regardless of plugin
+        // count; this is the *only* parallel region — Codex and Claude's
+        // marketplace mutations stay sequential, so the Codex-before-Claude
+        // split-brain ordering is untouched. Every failure is collected (not
+        // bailed on the first) so one bad plugin can't mask the rest, and the
+        // aggregate is sorted so the error message is deterministic.
+        const MAX_INSTALL_CONCURRENCY: usize = 4;
+        let workers = m.plugins.len().clamp(1, MAX_INSTALL_CONCURRENCY);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let failures: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(p) = m.plugins.get(i) else { break };
+                    let spec = format!("{p}@{}", m.name);
+                    match runner.run(
+                        "claude",
+                        &["plugin", "install", &spec, "--scope", scope],
+                        None,
+                    ) {
+                        Ok(out) if out.success() => {
+                            reporter.event(Event::Plugin { name: p });
+                        }
+                        Ok(out) => failures
+                            .lock()
+                            .unwrap()
+                            .push((spec, out.stderr.trim().to_string())),
+                        Err(e) => failures.lock().unwrap().push((spec, e.to_string())),
+                    }
+                });
             }
-            reporter.event(Event::Plugin { name: p });
+        });
+
+        let mut failures = failures.into_inner().unwrap();
+        if !failures.is_empty() {
+            failures.sort();
+            let detail = failures
+                .iter()
+                .map(|(spec, err)| format!("  {spec}: {err}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            bail!(
+                "{} plugin install{} failed:\n{detail}",
+                failures.len(),
+                if failures.len() == 1 { "" } else { "s" }
+            );
         }
         plugins = m.plugins.clone();
         Some(m.name.clone())
@@ -675,8 +715,8 @@ impl CommandOutput {
 pub mod fake {
     use super::*;
     use camino::Utf8PathBuf;
-    use std::cell::RefCell;
     use std::collections::VecDeque;
+    use std::sync::Mutex;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct RecordedCall {
@@ -695,31 +735,34 @@ pub mod fake {
         }
     }
 
-    type Matcher = Box<dyn Fn(&str, &[&str]) -> bool>;
+    // `Send + Sync` so a `RecordingRunner` satisfies the `CommandRunner:
+    // Send + Sync` bound and can be shared across the install-fan-out threads.
+    type Matcher = Box<dyn Fn(&str, &[&str]) -> bool + Send + Sync>;
 
     struct Rule {
         pred: Matcher,
         /// Successive responses; the last one is reused once exhausted.
-        responses: RefCell<VecDeque<CommandOutput>>,
+        /// `Mutex` (not `RefCell`) so the runner stays `Sync`.
+        responses: Mutex<VecDeque<CommandOutput>>,
     }
 
     pub struct RecordingRunner {
         rules: Vec<Rule>,
-        calls: RefCell<Vec<RecordedCall>>,
+        calls: Mutex<Vec<RecordedCall>>,
     }
 
     impl RecordingRunner {
         pub fn new() -> Self {
             RecordingRunner {
                 rules: Vec::new(),
-                calls: RefCell::new(Vec::new()),
+                calls: Mutex::new(Vec::new()),
             }
         }
 
         /// Script a single response for calls matching `pred(program, args)`.
         pub fn on(
             self,
-            pred: impl Fn(&str, &[&str]) -> bool + 'static,
+            pred: impl Fn(&str, &[&str]) -> bool + Send + Sync + 'static,
             out: CommandOutput,
         ) -> Self {
             self.on_seq(pred, vec![out])
@@ -729,12 +772,12 @@ pub mod fake {
         /// #2 → second, …; the last response repeats once exhausted).
         pub fn on_seq(
             mut self,
-            pred: impl Fn(&str, &[&str]) -> bool + 'static,
+            pred: impl Fn(&str, &[&str]) -> bool + Send + Sync + 'static,
             outs: Vec<CommandOutput>,
         ) -> Self {
             self.rules.push(Rule {
                 pred: Box::new(pred),
-                responses: RefCell::new(outs.into()),
+                responses: Mutex::new(outs.into()),
             });
             self
         }
@@ -753,7 +796,12 @@ pub mod fake {
         }
 
         pub fn lines(&self) -> Vec<String> {
-            self.calls.borrow().iter().map(RecordedCall::line).collect()
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(RecordedCall::line)
+                .collect()
         }
     }
 
@@ -764,14 +812,14 @@ pub mod fake {
             args: &[&str],
             cwd: Option<&Utf8Path>,
         ) -> Result<CommandOutput> {
-            self.calls.borrow_mut().push(RecordedCall {
+            self.calls.lock().unwrap().push(RecordedCall {
                 program: program.to_string(),
                 args: args.iter().map(|s| s.to_string()).collect(),
                 cwd: cwd.map(|c| c.to_path_buf()),
             });
             for rule in &self.rules {
                 if (rule.pred)(program, args) {
-                    let mut q = rule.responses.borrow_mut();
+                    let mut q = rule.responses.lock().unwrap();
                     let out = if q.len() > 1 {
                         q.pop_front().unwrap()
                     } else {
@@ -789,6 +837,7 @@ pub mod fake {
 mod orchestration_tests {
     use super::fake::RecordingRunner;
     use super::*;
+    use std::collections::HashSet;
 
     fn tmp() -> (tempfile::TempDir, Utf8PathBuf) {
         let d = tempfile::tempdir().unwrap();
@@ -801,6 +850,13 @@ mod orchestration_tests {
     const CODEX_MKT: &str = r#"{ "name": "M", "plugins": [
         { "name": "p1", "policy": { "authentication": "ON_INSTALL" } },
         { "name": "p2", "policy": { "authentication": "ON_INSTALL" } }
+    ] }"#;
+    const CLAUDE_MKT3: &str = r#"{ "name": "M",
+        "plugins": [ {"name":"p1"}, {"name":"p2"}, {"name":"p3"} ] }"#;
+    const CODEX_MKT3: &str = r#"{ "name": "M", "plugins": [
+        { "name": "p1", "policy": { "authentication": "ON_INSTALL" } },
+        { "name": "p2", "policy": { "authentication": "ON_INSTALL" } },
+        { "name": "p3", "policy": { "authentication": "ON_INSTALL" } }
     ] }"#;
 
     /// A temp repo with both marketplace files written, plus a Config and a
@@ -966,6 +1022,73 @@ mod orchestration_tests {
             .collect()
     }
 
+    // The Claude plugin-install loop now fans out across scoped threads, so the
+    // *relative order of the install calls is nondeterministic*. These helpers
+    // let the order-sensitive tests pin everything that is still deterministic
+    // (the split-brain backbone, presence gating, the post-assert `list`) while
+    // asserting the installs by set membership plus a bracket invariant.
+
+    /// Agent calls with `plugin install` removed — order is still fully
+    /// deterministic and pins the Codex-before-Claude ordering.
+    fn backbone(lines: &[String]) -> Vec<String> {
+        agent_lines(lines)
+            .into_iter()
+            .filter(|l| !l.contains("plugin install"))
+            .collect()
+    }
+
+    /// The set of `plugin install` calls (sequence is nondeterministic).
+    /// Set membership alone can't catch a *duplicate* install, so pair it
+    /// with [`install_count`] — a cursor off-by-one that double-claims an
+    /// index would slip past `installs` but not the count.
+    fn installs(lines: &[String]) -> HashSet<String> {
+        agent_lines(lines)
+            .into_iter()
+            .filter(|l| l.contains("plugin install"))
+            .collect()
+    }
+
+    /// How many `plugin install` calls were made (un-deduplicated): proves
+    /// each plugin was installed exactly once across the fan-out.
+    fn install_count(lines: &[String]) -> usize {
+        agent_lines(lines)
+            .iter()
+            .filter(|l| l.contains("plugin install"))
+            .count()
+    }
+
+    /// Every install must run strictly after the Claude `marketplace add`
+    /// (the parallel region must stay inside that bracket). `before` is an
+    /// agent line every install must also precede — sync's post-assert
+    /// `list`; reset has no trailing list and passes `None`.
+    fn assert_installs_bracketed(lines: &[String], after: &str, before: Option<&str>) {
+        let agent = agent_lines(lines);
+        let after_idx = agent
+            .iter()
+            .position(|l| l.as_str() == after)
+            .unwrap_or_else(|| panic!("expected {after:?} in {agent:?}"));
+        let before_idx = before.map(|b| {
+            agent
+                .iter()
+                .rposition(|l| l.as_str() == b)
+                .unwrap_or_else(|| panic!("expected {b:?} in {agent:?}"))
+        });
+        for (i, l) in agent.iter().enumerate() {
+            if l.contains("plugin install") {
+                assert!(
+                    i > after_idx,
+                    "install {l:?} must run after {after:?}: {agent:?}"
+                );
+                if let Some(bi) = before_idx {
+                    assert!(
+                        i < bi,
+                        "install {l:?} must run before {before:?}: {agent:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn sync_happy_path_runs_codex_then_claude_in_exact_order() {
         let f = fixture();
@@ -982,8 +1105,11 @@ mod orchestration_tests {
         .unwrap();
 
         let repo = f.repo.as_str();
+        let lines = r.lines();
+        // Deterministic backbone: Codex fully before Claude (split-brain
+        // ordering), presence gating, and the trailing post-assert `list`.
         assert_eq!(
-            agent_lines(&r.lines()),
+            backbone(&lines),
             vec![
                 format!("claude plugin validate {repo}"),
                 "codex plugin marketplace remove M".to_string(),
@@ -991,10 +1117,25 @@ mod orchestration_tests {
                 "claude plugin marketplace list --json".to_string(),
                 "claude plugin marketplace remove M".to_string(),
                 format!("claude plugin marketplace add {repo}"),
-                "claude plugin install p1@M --scope user".to_string(),
-                "claude plugin install p2@M --scope user".to_string(),
                 "claude plugin marketplace list --json".to_string(),
             ]
+        );
+        // Both installs happened, each exactly once (order nondeterministic
+        // across the fan-out; the count guards against a cursor double-claim).
+        assert_eq!(install_count(&lines), 2, "each plugin installed once");
+        assert_eq!(
+            installs(&lines),
+            HashSet::from([
+                "claude plugin install p1@M --scope user".to_string(),
+                "claude plugin install p2@M --scope user".to_string(),
+            ])
+        );
+        // …and strictly between the Claude `marketplace add` and the
+        // post-sync identity assertion's `list`.
+        assert_installs_bracketed(
+            &lines,
+            &format!("claude plugin marketplace add {repo}"),
+            Some("claude plugin marketplace list --json"),
         );
         assert_eq!(report.repo_root, f.repo);
         assert_eq!(report.claude_name.as_deref(), Some("M"));
@@ -1124,15 +1265,95 @@ mod orchestration_tests {
             );
         let rep = crate::output::RecordingReporter::default();
 
-        let res = sync(&r, &f.repo, &f.codex_cfg, &f.cfg, &rep);
+        let err = sync(&r, &f.repo, &f.codex_cfg, &f.cfg, &rep)
+            .expect_err("sync should fail when plugin 2 fails to install")
+            .to_string();
+        // The failure is aggregated and names the offending plugin + stderr.
+        assert!(
+            err.contains("p2@M"),
+            "error should name the failed plugin: {err}"
+        );
+        assert!(
+            err.contains("boom"),
+            "error should include the install stderr: {err}"
+        );
 
-        assert!(res.is_err(), "sync should fail on plugin 2");
-        let trail = rep.lines.borrow();
+        let trail = rep.lines.lock().unwrap();
         // The completed steps remain visible; p2 never got a line.
         assert!(trail.iter().any(|l| l == "Codex   ~ M"), "{trail:?}");
         assert!(trail.iter().any(|l| l == "Claude  ~ M"), "{trail:?}");
         assert!(trail.iter().any(|l| l == "+ p1"), "{trail:?}");
         assert!(!trail.iter().any(|l| l == "+ p2"), "{trail:?}");
+    }
+
+    #[test]
+    fn sync_runs_all_installs_even_when_one_fails() {
+        let f = fixture();
+        // p1 fails; p2 must still be attempted and succeed — proving the
+        // fan-out collects failures instead of bailing on the first one.
+        let r = happy_runner(&f.repo).on(
+            |p, a| p == "claude" && a.contains(&"install") && a.iter().any(|x| x.contains("p1@")),
+            CommandOutput::fail(1, "p1 exploded"),
+        );
+        let rep = crate::output::RecordingReporter::default();
+
+        let err = sync(&r, &f.repo, &f.codex_cfg, &f.cfg, &rep)
+            .expect_err("a failed install must fail the sync")
+            .to_string();
+
+        assert!(err.contains("p1@M"), "{err}");
+        assert!(err.contains("p1 exploded"), "{err}");
+        let trail = rep.lines.lock().unwrap();
+        assert!(
+            trail.iter().any(|l| l == "+ p2"),
+            "p2 must still install when p1 fails: {trail:?}"
+        );
+        assert!(!trail.iter().any(|l| l == "+ p1"), "{trail:?}");
+    }
+
+    #[test]
+    fn sync_aggregates_multiple_install_failures() {
+        let f = fixture();
+        std::fs::write(f.repo.join(".claude-plugin/marketplace.json"), CLAUDE_MKT3).unwrap();
+        std::fs::write(f.repo.join(".agents/plugins/marketplace.json"), CODEX_MKT3).unwrap();
+        let r = happy_runner(&f.repo)
+            .on(
+                |p, a| {
+                    p == "claude" && a.contains(&"install") && a.iter().any(|x| x.contains("p1@"))
+                },
+                CommandOutput::fail(1, "first boom"),
+            )
+            .on(
+                |p, a| {
+                    p == "claude" && a.contains(&"install") && a.iter().any(|x| x.contains("p3@"))
+                },
+                CommandOutput::fail(2, "third boom"),
+            );
+
+        let err = sync(
+            &r,
+            &f.repo,
+            &f.codex_cfg,
+            &f.cfg,
+            &crate::output::NoopReporter,
+        )
+        .expect_err("two failed installs must fail the sync")
+        .to_string();
+
+        assert!(
+            err.contains("2 plugin installs failed"),
+            "should aggregate the count: {err}"
+        );
+        let p1 = err.find("p1@M").expect("p1 named in error");
+        let p3 = err.find("p3@M").expect("p3 named in error");
+        assert!(
+            p1 < p3,
+            "aggregated failures must be sorted for a deterministic message: {err}"
+        );
+        assert!(
+            err.contains("first boom") && err.contains("third boom"),
+            "both stderrs must surface: {err}"
+        );
     }
 
     fn status_runner(repo: &Utf8Path, origin: &str) -> RecordingRunner {
@@ -1194,17 +1415,30 @@ mod orchestration_tests {
 
         assert_eq!(report.source, "git@github.com:co/agent-mkt.git");
         assert_eq!(report.plugins, vec!["p1", "p2"]);
+        let lines = r.lines();
         assert_eq!(
-            agent_lines(&r.lines()),
+            backbone(&lines),
             vec![
                 "codex plugin marketplace remove M".to_string(),
                 "codex plugin marketplace add git@github.com:co/agent-mkt.git".to_string(),
                 "claude plugin marketplace list --json".to_string(),
                 "claude plugin marketplace remove M".to_string(),
                 "claude plugin marketplace add git@github.com:co/agent-mkt.git".to_string(),
+            ]
+        );
+        assert_eq!(install_count(&lines), 2, "each plugin installed once");
+        assert_eq!(
+            installs(&lines),
+            HashSet::from([
                 "claude plugin install p1@M --scope user".to_string(),
                 "claude plugin install p2@M --scope user".to_string(),
-            ]
+            ])
+        );
+        // reset has no post-assert `list`; installs are simply after the add.
+        assert_installs_bracketed(
+            &lines,
+            "claude plugin marketplace add git@github.com:co/agent-mkt.git",
+            None,
         );
     }
 

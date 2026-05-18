@@ -77,7 +77,6 @@ fn cwd() -> Result<Utf8PathBuf> {
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let runner = RealCommandRunner;
-    let reporter = StderrReporter;
 
     match cli.command {
         Command::Init {
@@ -96,28 +95,46 @@ pub fn run() -> Result<()> {
         }
         Command::Sync => {
             let cfg = load_config()?;
+            // Resolve paths *before* the spinner exists so a path error can't
+            // strand a live frame on screen.
+            let cwd = cwd()?;
+            let codex_cfg = codex_config_path()?;
+            let reporter = make_reporter();
             let start = Instant::now();
-            let report = command::sync(&runner, &cwd()?, &codex_config_path()?, &cfg, &reporter)?;
-            anstream::eprintln!("{}", output::sync_summary(&report, start.elapsed()));
+            let result = command::sync(&runner, &cwd, &codex_cfg, &cfg, reporter.as_ref());
+            let elapsed = start.elapsed();
+            // Clear the spinner *before* the summary or an error report is
+            // printed, so neither is drawn over a live frame; the streamed
+            // trail printed above the spinner stays on screen.
+            reporter.finish();
+            let report = result?;
             anstream::eprintln!(
-                "  {}",
-                output::warning(&output::restart_notice(
+                "{}",
+                output::sync_summary(
+                    &report,
+                    elapsed,
                     cfg.targets.claude.enabled,
                     cfg.targets.codex.enabled
-                ))
+                )
             );
         }
         Command::Reset => {
             let cfg = load_config()?;
+            let cwd = cwd()?;
+            let reporter = make_reporter();
             let start = Instant::now();
-            let report = command::reset(&runner, &cwd()?, &cfg, &reporter)?;
-            anstream::eprintln!("{}", output::reset_summary(&report.source, start.elapsed()));
+            let result = command::reset(&runner, &cwd, &cfg, reporter.as_ref());
+            let elapsed = start.elapsed();
+            reporter.finish();
+            let report = result?;
             anstream::eprintln!(
-                "  {}",
-                output::warning(&output::restart_notice(
+                "{}",
+                output::reset_summary(
+                    &report.source,
+                    elapsed,
                     cfg.targets.claude.enabled,
                     cfg.targets.codex.enabled
-                ))
+                )
             );
         }
         Command::Status => {
@@ -133,16 +150,31 @@ pub fn run() -> Result<()> {
                     )
                 );
             }
-            anstream::eprintln!(
-                "  {}",
-                output::warning(&output::restart_reminder(
-                    cfg.targets.claude.enabled,
-                    cfg.targets.codex.enabled
-                ))
-            );
         }
     }
     Ok(())
+}
+
+/// Pick the `sync`/`reset` progress reporter: an animated spinner only on an
+/// interactive terminal; otherwise the plain streamed reporter, so piped/CI
+/// output stays exactly as it was before the spinner existed.
+///
+/// Whether ANSI should be emitted at all (`NO_COLOR`, `CLICOLOR`,
+/// `CLICOLOR_FORCE`, `TERM`, global override) is deferred to `anstream` — the
+/// same authority the rest of the tool's output uses — for one consistent
+/// color discipline. A real TTY is *additionally* required: the spinner needs
+/// cursor control, so `CLICOLOR_FORCE` into a pipe must not animate. `CI` is
+/// its own carve-out: even a CI that wants color must not get a redrawing
+/// spinner in its logs.
+fn make_reporter() -> Box<dyn output::Reporter> {
+    use std::io::IsTerminal;
+    let ansi = anstream::AutoStream::choice(&std::io::stderr()) != anstream::ColorChoice::Never;
+    let interactive = std::io::stderr().is_terminal() && ansi && std::env::var_os("CI").is_none();
+    if interactive {
+        Box::new(output::ProgressReporter::new())
+    } else {
+        Box::new(StderrReporter)
+    }
 }
 
 /// Write a stdout payload, exiting silently (status 0) on a closed pipe so
